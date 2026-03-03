@@ -1,0 +1,35 @@
+resources:
+  accelerators: tpu-v6e-1
+  accelerator_args:
+    tpu_vm: True
+    runtime_version: v2-alpha-tpuv6e
+file_mounts:
+  ~/.ssh/id_rsa: ~/.ssh/id_rsa
+  ~/.codex: ~/.codex
+setup: |
+  chmod 600 ~/.ssh/id_rsa
+  rm -f ~/.ssh/config
+
+  # 自动获取并添加 GitHub 的 SSH 主机指纹，绕过 yes/no 交互
+  ssh-keyscan -H github.com >> ~/.ssh/known_hosts
+
+  git config --global user.name "lingebeng" && git config --global user.email "1371675203@qq.com"
+  echo  "conda deactivate" >> ~/.bashrc
+  # 1. 安装 nvm (增加 -s 保持输出整洁，如果已安装则跳过)
+  curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.39.7/install.sh | bash
+
+  # 2. 加载 nvm 环境到当前会话（非常重要，否则接下来的 nvm 命令会找不到）
+  export NVM_DIR="$HOME/.nvm"
+  [ -s "$NVM_DIR/nvm.sh" ] && \. "$NVM_DIR/nvm.sh"
+
+  # 3. 安装并使用 Node 20
+  nvm install 20
+  nvm use 20
+  nvm alias default 20
+
+  # 4. 安装全局 npm 包
+  npm i -g @openai/codex
+
+  cd ~/sky_workdir
+
+  git clone git@github.com:lingebeng/op_dev.git

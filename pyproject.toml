@@ -1,0 +1,23 @@
+[project]
+name = "op-dev"
+version = "0.1.0"
+description = "op dev record"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "pre-commit>=4.5.1",
+    "ruff>=0.15.0",
+]
+
+
+[project.optional-dependencies]
+tpu = [
+    "jax[tpu]",
+    "libtpu==0.0.30",
+]
+cuda = [
+    "jax[cuda]",
+]
+cpu = [
+    "jax==0.8.1",
+]
