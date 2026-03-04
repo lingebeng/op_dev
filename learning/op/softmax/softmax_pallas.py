@@ -46,7 +46,7 @@ def pallas_softmax(x):
         ],
         out_specs=pl.BlockSpec(index_map=lambda i: (i, 0), block_shape=(block_size, L)),
         grid=grid,
-        interpret=False,
+        interpret=True,
     )(x)
 
 
