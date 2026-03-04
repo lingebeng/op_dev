@@ -31,9 +31,9 @@ def pallas_softmax(x):
     使用 pallas_call 包装 kernel，定义分块（BlockSpec）和网格（Grid）
     """
     B, L = x.shape
-
+    block_size = 64
     # 设定 Grid: 针对第一维 (Batch) 并行，每个 Block 负责一行
-    grid = (B,)
+    grid = (B // block_size,)
 
     return pl.pallas_call(
         softmax_kernel,
@@ -41,10 +41,12 @@ def pallas_softmax(x):
         # BlockSpec 定义了如何将 HBM 中的数据映射到 SRAM 中
         # lambda i: (i, 0) 表示第 i 个 grid 处理输入张量的第 i 行，列方向从 0 开始
         # (1, L) 表示每次加载 1 行，长度为 L
-        in_specs=[pl.BlockSpec(index_map=lambda i: (i, 0), block_shape=(1, L))],
-        out_specs=pl.BlockSpec(index_map=lambda i: (i, 0), block_shape=(1, L)),
+        in_specs=[
+            pl.BlockSpec(index_map=lambda i: (i, 0), block_shape=(block_size, L))
+        ],
+        out_specs=pl.BlockSpec(index_map=lambda i: (i, 0), block_shape=(block_size, L)),
         grid=grid,
-        interpret=True,
+        interpret=False,
     )(x)
 
 
