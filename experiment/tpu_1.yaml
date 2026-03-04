@@ -33,3 +33,6 @@ setup: |
   cd ~/sky_workdir
 
   git clone git@github.com:lingebeng/op_dev.git
+
+  cd op_dev
+  uv sync --extra tpu
