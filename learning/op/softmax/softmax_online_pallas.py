@@ -5,10 +5,10 @@ import jax.numpy as jnp
 from jax.experimental import pallas as pl
 
 
-def online_softmax_kernel(x_ref, o_ref, *, block_L):
+def online_softmax_kernel(x_ref, o_ref, *, block_L, block_B):
     """
-    Pallas Online Softmax 底层 Kernel
-    注意：这里的 x_ref 和 o_ref 接收到的是一整行数据 (1, L) 的引用视图。
+    Pallas Online Softmax (TPU 8x128 对齐版)
+    x_ref 和 o_ref 接收的是 (block_B, padded_L) 的二维块
     """
     padded_L = x_ref.shape[1]
     num_blocks = padded_L // block_L
@@ -19,25 +19,24 @@ def online_softmax_kernel(x_ref, o_ref, *, block_L):
     def pass1_body(i, state):
         m_prev, d_prev = state
 
-        # 动态加载当前的数据块到 Vmem (TPU 向量寄存器)
-        # pl.dslice(start, size) 用于动态切片
-        x_chunk = x_ref[0, pl.dslice(i * block_L, block_L)].astype(jnp.float32)
+        # 加载当前的数据块，此时提取的是 block_B 行
+        x_chunk = x_ref[:, pl.dslice(i * block_L, block_L)].astype(jnp.float32)
 
-        # 计算局部统计量
-        m_local = jnp.max(x_chunk)
+        # 按行计算局部统计量，保持 (block_B, 1) 的形状
+        m_local = jnp.max(x_chunk, axis=-1, keepdims=True)
         m_new = jnp.maximum(m_prev, m_local)
 
-        # 核心步骤：修正之前的指数和，并累加当前块
+        # 修正指数和，并累加当前块
         d_prev_scaled = d_prev * jnp.exp(m_prev - m_new)
-        d_local = jnp.sum(jnp.exp(x_chunk - m_new))
+        d_local = jnp.sum(jnp.exp(x_chunk - m_new), axis=-1, keepdims=True)
         d_new = d_prev_scaled + d_local
 
         return m_new, d_new
 
-    # 初始化 m 为极小值，d 为 0
+    # 初始化状态为 (block_B, 1) 的列向量
     init_state = (
-        jnp.array(-jnp.inf, dtype=jnp.float32),
-        jnp.array(0.0, dtype=jnp.float32),
+        jnp.full((block_B, 1), -jnp.inf, dtype=jnp.float32),
+        jnp.full((block_B, 1), 0.0, dtype=jnp.float32),
     )
     m_final, d_final = jax.lax.fori_loop(0, num_blocks, pass1_body, init_state)
 
@@ -45,14 +44,12 @@ def online_softmax_kernel(x_ref, o_ref, *, block_L):
     # Pass 2: 再次扫描原始数据，计算概率并写入输出
     # ==========================================
     def pass2_body(i, _):
-        # 重新将块加载进 SRAM
-        x_chunk = x_ref[0, pl.dslice(i * block_L, block_L)].astype(jnp.float32)
+        x_chunk = x_ref[:, pl.dslice(i * block_L, block_L)].astype(jnp.float32)
 
-        # 使用 Pass 1 算出的全局 m_final 和 d_final 进行归一化
+        # 向量广播机制：(block_B, block_L) 减去 (block_B, 1)
         o_chunk = (jnp.exp(x_chunk - m_final) / d_final).astype(o_ref.dtype)
 
-        # 将结果写回输出引用
-        o_ref[0, pl.dslice(i * block_L, block_L)] = o_chunk
+        o_ref[:, pl.dslice(i * block_L, block_L)] = o_chunk
 
     jax.lax.fori_loop(0, num_blocks, pass2_body, None)
 
@@ -60,43 +57,53 @@ def online_softmax_kernel(x_ref, o_ref, *, block_L):
 @jax.jit
 def pallas_online_softmax(x):
     B, L = x.shape
-    block_L = 256
+
+    # --- 硬件硬性对齐参数 ---
+    block_L = 256  # 128 的倍数
+    block_B = 8  # 8 的倍数
+
     padded_L = ((L + block_L - 1) // block_L) * block_L
+    padded_B = ((B + block_B - 1) // block_B) * block_B
 
-    # 对齐到 block_L，padding 为 -inf，不影响 softmax 结果
-    if padded_L != L:
-        x = jnp.pad(x, ((0, 0), (0, padded_L - L)), constant_values=-jnp.inf)
+    # 沿两个维度进行 padding
+    pad_B_len = padded_B - B
+    pad_L_len = padded_L - L
+    if pad_B_len > 0 or pad_L_len > 0:
+        x = jnp.pad(x, ((0, pad_B_len), (0, pad_L_len)), constant_values=-jnp.inf)
 
-    # Grid 仅在 Batch 维度并行，启动 B 个底层线程
-    grid = (B,)
+    # Grid：每个线程块处理 block_B 行，总网格数除以 block_B
+    grid = (padded_B // block_B,)
     interpret = jax.default_backend() == "cpu"
-    kernel = functools.partial(online_softmax_kernel, block_L=block_L)
+
+    kernel = functools.partial(online_softmax_kernel, block_L=block_L, block_B=block_B)
 
     out = pl.pallas_call(
         kernel,
         out_shape=jax.ShapeDtypeStruct(x.shape, x.dtype),
-        # BlockSpec 映射整行数据，将底层的显存加载控制权完全交给 Kernel 内部的循环
-        in_specs=[pl.BlockSpec(index_map=lambda i: (i, 0), block_shape=(1, padded_L))],
-        out_specs=pl.BlockSpec(index_map=lambda i: (i, 0), block_shape=(1, padded_L)),
+        # in_specs 的 block_shape 更新为 (block_B, padded_L)
+        in_specs=[
+            pl.BlockSpec(index_map=lambda i: (i, 0), block_shape=(block_B, padded_L))
+        ],
+        out_specs=pl.BlockSpec(
+            index_map=lambda i: (i, 0), block_shape=(block_B, padded_L)
+        ),
         grid=grid,
         interpret=interpret,
     )(x)
-    return out[:, :L]
+
+    # 裁剪掉 Padding 的部分，返回真实大小
+    return out[:B, :L]
 
 
 # 测试代码
 if __name__ == "__main__":
-    # 生成随机测试数据（故意使用非 block 对齐长度）
     key = jax.random.PRNGKey(0)
-    x = jax.random.normal(key, (1024, 2050))
+    # 使用 bfloat16 进一步榨干 TPU 带宽
+    x = jax.random.normal(key, (1024, 2050), dtype=jnp.bfloat16)
 
-    # Pallas 版本
     out_pallas = pallas_online_softmax(x)
-
-    # JAX 原生版本 (参考基准)
     out_jax = jax.nn.softmax(x, axis=-1)
-    print("Pallas 输出形状:", out_pallas.shape)
 
-    # 验证正确性
+    print("Pallas 输出形状:", out_pallas.shape)
     print("最大误差:", jnp.max(jnp.abs(out_pallas - out_jax)))
-    print("结果是否一致?", jnp.allclose(out_pallas, out_jax, atol=1e-5))
+    print("结果是否一致?", jnp.allclose(out_pallas, out_jax, atol=1e-3))
