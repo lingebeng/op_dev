@@ -3,14 +3,14 @@ import jax.numpy as jnp
 from jax.experimental import pallas as pl
 
 
-def swallow_axis0_kernel(x_ref, o_ref):
+def reduce_sum_kernel(x_ref, o_ref):
     # x_ref 被切出来后的形状是 (8, block_M, block_N)
     # 直接在 SRAM 内沿第 0 个维度“一口吞”求和
     o_ref[...] = jnp.sum(x_ref[...], axis=0)
 
 
 @jax.jit
-def pallas_reduce_axis0_swallow(x):
+def reduce_sum(x):
     B, M, N = x.shape  # 8, 1024, 1024
 
     # 针对 1024x1024 进行二维分块
@@ -20,7 +20,7 @@ def pallas_reduce_axis0_swallow(x):
     grid = (M // block_M, N // block_N)
     interpret = jax.default_backend() == "cpu"
     out = pl.pallas_call(
-        swallow_axis0_kernel,
+        reduce_sum_kernel,
         out_shape=jax.ShapeDtypeStruct((M, N), x.dtype),
         in_specs=[
             pl.BlockSpec(
@@ -47,7 +47,7 @@ if __name__ == "__main__":
     key = jax.random.PRNGKey(0)
     x = jnp.ones((8, 1024, 1024))
 
-    out_pallas = pallas_reduce_axis0_swallow(x)
+    out_pallas = reduce_sum(x)
     out_jax = jnp.sum(x, axis=0)
 
     print("Pallas 输出形状:", out_pallas.shape)

@@ -20,7 +20,7 @@ def reduce_sum(x: jax.Array, block_size: tuple[int, ...] = (256, 256)) -> jax.Ar
         reduce_sum_kernel,
         grid=grid,
         # None in `block_shape` means we pick a size of 1 and squeeze it away
-        in_specs=[pl.BlockSpec((None, *block_size), lambda i, j, k: (k, i, j))],
+        in_specs=[pl.BlockSpec((1, *block_size), lambda i, j, k: (k, i, j))],
         out_specs=pl.BlockSpec(block_size, lambda i, j, k: (i, j)),
         out_shape=jax.ShapeDtypeStruct(out_shape, x.dtype),
         interpret=interpret,
