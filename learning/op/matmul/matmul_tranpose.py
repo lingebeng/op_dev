@@ -6,19 +6,30 @@ import jax.numpy as jnp
 import numpy as np
 import functools
 
-def matmul_kernel(x_ref, y_ref, z_ref, acc_ref, *, nsteps):
+
+def matmul_kernel(x_ref, y_ref, z_ref, acc_ref, *, nsteps, transpose_rhs):
     @pl.when(pl.program_id(2) == 0)
     def _():
         acc_ref[...] = jnp.zeros_like(acc_ref)
 
-    acc_ref[...] += jnp.dot(x_ref[...], y_ref[...], preferred_element_type=jnp.float32)
+    if transpose_rhs:
+        dims = ((1,), (1,)), ((), ())
+    else:
+        dims = ((1,), (0,)), ((), ())
+
+    acc_ref[...] += jax.lax.dot(
+        x_ref[...],
+        y_ref[...],
+        dimension_numbers=dims,
+        preferred_element_type=jnp.float32,
+    )
 
     @pl.when(pl.program_id(2) == nsteps - 1)
     def _():
         z_ref[...] = acc_ref[...].astype(z_ref.dtype)
 
 
-@functools.partial(jax.jit, static_argnames=["bm", "bk", "bn"])
+@functools.partial(jax.jit, static_argnames=["bm", "bk", "bn", "transpose_rhs"])
 def matmul(
     x: jax.Array,
     y: jax.Array,
@@ -26,16 +37,23 @@ def matmul(
     bm: int = 128,
     bk: int = 128,
     bn: int = 128,
+    transpose_rhs: bool = False,
 ):
+    if transpose_rhs:
+        y = y.swapaxes(0, 1)
+        y_block_spec = pl.BlockSpec((bn, bk), lambda i, j, k: (j, k))
+    else:
+        y_block_spec = pl.BlockSpec((bk, bn), lambda i, j, k: (k, j))
     m, k = x.shape
-    _, n = y.shape
+    n, _ = y.shape
+    print(f"m={m}, k={k}, n={n}")
     return pl.pallas_call(
-        functools.partial(matmul_kernel, nsteps=k // bk),
+        functools.partial(matmul_kernel, nsteps=k // bk, transpose_rhs=transpose_rhs),
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=0,
             in_specs=[
                 pl.BlockSpec((bm, bk), lambda i, j, k: (i, k)),
-                pl.BlockSpec((bk, bn), lambda i, j, k: (k, j)),
+                y_block_spec,
             ],
             out_specs=pl.BlockSpec((bm, bn), lambda i, j, k: (i, j)),
             scratch_shapes=[pltpu.VMEM((bm, bn), jnp.float32)],
@@ -49,8 +67,9 @@ def matmul(
 
 
 if __name__ == "__main__":
-    m, k, n = 4096, 4096, 4096
+    m, k, n = 4096, 8192, 4096
     k1, k2 = random.split(random.key(0), 2)
     x = random.normal(k1, (m, k), dtype=jnp.bfloat16)
-    y = random.normal(k2, (k, n), dtype=jnp.bfloat16)
-    np.testing.assert_array_equal(x @ y, matmul(x, y))
+    y = random.normal(k2, (n, k), dtype=jnp.bfloat16)
+    y = y.T
+    np.testing.assert_array_equal(x @ y, matmul(x, y, transpose_rhs=True))
