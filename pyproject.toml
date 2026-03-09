@@ -26,3 +26,6 @@ cpu = [
     "jax==0.8.1",
 
 ]
+
+[tool.ruff]
+ignore = ["E741"]
