@@ -1,5 +1,4 @@
 import functools
-import math
 
 import jax
 import jax.numpy as jnp
@@ -22,19 +21,20 @@ def prepare_chunk_indices(
 ) -> jax.Array:
     """Build a mapping from physical chunks to logical sequences for varlen inputs."""
     lens = prepare_lens(cu_seqlens)
-    lens_list = [int(x) for x in lens]
+    n_chunks = -(-lens // chunk_size)  # ceil division
+    total_nt = int(jnp.sum(n_chunks))
+    num_seqs = len(lens)
 
-    seq_ids = []
-    block_ids = []
-    for i, length in enumerate(lens_list):
-        nt = math.ceil(length / chunk_size)
-        seq_ids.extend([i] * nt)
-        block_ids.extend(range(nt))
-
-    return jnp.array(
-        list(zip(seq_ids, block_ids)),
-        dtype=jnp.int32,
+    seq_ids = jnp.repeat(
+        jnp.arange(num_seqs, dtype=jnp.int32), n_chunks, total_repeat_length=total_nt
     )
+    prefix_chunks = jnp.concatenate(
+        [jnp.zeros(1, dtype=jnp.int32), jnp.cumsum(n_chunks)]
+    )
+    seq_offsets = jnp.repeat(prefix_chunks[:-1], n_chunks, total_repeat_length=total_nt)
+    block_ids = jnp.arange(total_nt, dtype=jnp.int32) - seq_offsets
+
+    return jnp.stack([seq_ids, block_ids], axis=1)
 
 
 def chunk_cumsum_kernel(
@@ -48,34 +48,39 @@ def chunk_cumsum_kernel(
     REVERSE: bool,
     HAS_SCALE: bool,
     scale: float,
+    IS_VARLEN: bool,
 ):
     i_s, i_t, i_bh = pl.program_id(0), pl.program_id(1), pl.program_id(2)
 
     i_n, local_i_t = chunk_indices_ref[i_t, 0], chunk_indices_ref[i_t, 1]
 
     bos, eos = cu_seqlens_ref[i_n], cu_seqlens_ref[i_n + 1]
-    T_seq = eos - bos
 
     start_t, start_s = bos + local_i_t * BT, i_s * BS
 
     # Each program handles one (BT, BS) tile.
     s = s_ref[i_bh, dslice(start_t, BT), dslice(start_s, BS)]
 
-    # Mask out-of-bounds elements.
-    valid_len = T_seq - local_i_t * BT
-    valid_mask = (jnp.arange(BT) < valid_len).astype(jnp.float32)[:, None]
-    s = s.astype(jnp.float32) * valid_mask
+    if IS_VARLEN:
+        T_seq = eos - bos
+        valid_len = T_seq - local_i_t * BT
+        valid_mask = (jnp.arange(BT) < valid_len).astype(jnp.float32)[:, None]
+        s = s.astype(jnp.float32) * valid_mask
+    else:
+        s = s.astype(jnp.float32)
 
     if REVERSE:
         o = jnp.cumsum(s[::-1], axis=0)[::-1]
     else:
-        # Forward mode: directly use the underlying scan.
         o = jnp.cumsum(s, axis=0)
 
     if HAS_SCALE:
         o = o * scale
 
-    o = (o * valid_mask).astype(o_ref.dtype)
+    if IS_VARLEN:
+        o = (o * valid_mask).astype(o_ref.dtype)
+    else:
+        o = o.astype(o_ref.dtype)
     o_ref[i_bh, dslice(start_t, BT), dslice(start_s, BS)] = o
 
 
@@ -119,15 +124,17 @@ def chunk_local_cumsum_vector(
     NS = S_padded // BS
 
     # For fixed-length inputs, synthesize cu_seqlens/chunk_indices to simplify kernel control flow.
-    if chunk_indices is not None or cu_seqlens is None:
+    is_varlen = cu_seqlens is not None
+    if cu_seqlens is None:
         cu_seqlens = jnp.arange(0, B * T + 1, BT, dtype=jnp.int32)
-
-    chunk_indices = prepare_chunk_indices(cu_seqlens, BT)
+    if chunk_indices is None:
+        chunk_indices = prepare_chunk_indices(cu_seqlens, BT)
     NT = len(chunk_indices)
     grid = (NS, NT, B * H)
 
     # In varlen mode, append BT padding at the end to prevent dslice overflow.
-    g_flat = jnp.pad(g_flat, ((0, 0), (0, BT), (0, 0)))
+    if is_varlen:
+        g_flat = jnp.pad(g_flat, ((0, 0), (0, BT), (0, 0)))
 
     kernel = functools.partial(
         chunk_cumsum_kernel,
@@ -136,6 +143,7 @@ def chunk_local_cumsum_vector(
         REVERSE=reverse,
         HAS_SCALE=HAS_SCALE,
         scale=scale_val,
+        IS_VARLEN=is_varlen,
     )
 
     o_flat = pl.pallas_call(
