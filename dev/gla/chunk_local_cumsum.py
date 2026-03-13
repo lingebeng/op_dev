@@ -68,20 +68,25 @@ def chunk_cumsum_kernel(
         s = s.astype(jnp.float32) * valid_mask
     else:
         s = s.astype(jnp.float32)
+    T = s.shape[0]
 
     if REVERSE:
-        o = jnp.cumsum(s[::-1], axis=0)[::-1]
+        rows = [s[T - 1]]
+        for i in range(T - 2, -1, -1):
+            rows.append(rows[-1] + s[i])
+        rows.reverse()
+        o = jnp.stack(rows, axis=0)
+
     else:
-        o = jnp.cumsum(s, axis=0)
+        rows = [s[0]]
+        for i in range(1, T):
+            rows.append(rows[-1] + s[i])
+        o = jnp.stack(rows, axis=0)
 
     if HAS_SCALE:
         o = o * scale
 
-    if IS_VARLEN:
-        o = (o * valid_mask).astype(o_ref.dtype)
-    else:
-        o = o.astype(o_ref.dtype)
-    o_ref[i_bh, dslice(start_t, BT), dslice(start_s, BS)] = o
+    o_ref[i_bh, dslice(start_t, BT), dslice(start_s, BS)] = o.astype(o_ref.dtype)
 
 
 def chunk_local_cumsum_vector(
@@ -113,7 +118,9 @@ def chunk_local_cumsum_vector(
     HAS_SCALE = scale is not None
     scale_val = scale if scale is not None else 1.0
 
-    interpret = jax.local_devices()[0].platform != "tpu"
+    interpret = (
+        jax.default_backend() != "tpu"
+    )  # Run the kernel in interpret mode on non-TPU backends for easier debugging.
 
     # Pad the S dimension to satisfy TPU shape constraints.
     pad_S = (BS - (S % BS)) % BS
