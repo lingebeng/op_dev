@@ -52,11 +52,14 @@ def chunk_cumsum_kernel(
 ):
     i_s, i_t, i_bh = pl.program_id(0), pl.program_id(1), pl.program_id(2)
 
-    i_n, local_i_t = chunk_indices_ref[i_t, 0], chunk_indices_ref[i_t, 1]
+    if IS_VARLEN:
+        i_n, local_i_t = chunk_indices_ref[i_t, 0], chunk_indices_ref[i_t, 1]
+        bos, eos = cu_seqlens_ref[i_n], cu_seqlens_ref[i_n + 1]
+        start_t = bos + local_i_t * BT
+    else:
+        start_t = i_t * BT
 
-    bos, eos = cu_seqlens_ref[i_n], cu_seqlens_ref[i_n + 1]
-
-    start_t, start_s = bos + local_i_t * BT, i_s * BS
+    start_s = i_s * BS
 
     # Each program handles one (BT, BS) tile.
     s = s_ref[i_bh, dslice(start_t, BT), dslice(start_s, BS)]
@@ -113,14 +116,12 @@ def chunk_local_cumsum_vector(
         g_flat = jnp.transpose(g, (0, 2, 1, 3)).reshape(B * H, T, S)
 
     BT = chunk_size
-    BS = min(128, S)
+    BS = 128
     out_dtype = output_dtype or g.dtype
     HAS_SCALE = scale is not None
     scale_val = scale if scale is not None else 1.0
 
-    interpret = (
-        jax.default_backend() != "tpu"
-    )  # Run the kernel in interpret mode on non-TPU backends for easier debugging.
+    interpret = jax.default_backend() != "tpu"
 
     # Pad the S dimension to satisfy TPU shape constraints.
     pad_S = (BS - (S % BS)) % BS
@@ -132,11 +133,15 @@ def chunk_local_cumsum_vector(
 
     # For fixed-length inputs, synthesize cu_seqlens/chunk_indices to simplify kernel control flow.
     is_varlen = cu_seqlens is not None
-    if cu_seqlens is None:
-        cu_seqlens = jnp.arange(0, B * T + 1, BT, dtype=jnp.int32)
-    if chunk_indices is None:
-        chunk_indices = prepare_chunk_indices(cu_seqlens, BT)
-    NT = len(chunk_indices)
+    if is_varlen:
+        if chunk_indices is None:
+            chunk_indices = prepare_chunk_indices(cu_seqlens, BT)
+        NT = len(chunk_indices)
+    else:
+        NT = (T + BT - 1) // BT
+        # Dummy arrays for scalar prefetch (not used in the kernel when IS_VARLEN=False).
+        cu_seqlens = jnp.zeros(1, dtype=jnp.int32)
+        chunk_indices = jnp.zeros((1, 2), dtype=jnp.int32)
     grid = (NS, NT, B * H)
 
     # In varlen mode, append BT padding at the end to prevent dslice overflow.

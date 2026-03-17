@@ -5,6 +5,7 @@ description = "op dev record"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
+    "jax>=0.8.1",
     "pre-commit>=4.5.1",
     "ruff>=0.15.0",
 ]
