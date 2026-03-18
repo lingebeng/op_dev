@@ -16,16 +16,10 @@ tpu = [
     "jax[tpu]",
     "libtpu==0.0.30",
     "setuptools>=82.0.0",
-    "tensorboard>=2.20.0",
-    "tensorboard-plugin-profile>=2.22.0",
     "torch>=2.10.0",
 ]
 cuda = [
     "jax[cuda]",
-]
-cpu = [
-    "jax==0.8.1",
-
 ]
 
 [tool.ruff]

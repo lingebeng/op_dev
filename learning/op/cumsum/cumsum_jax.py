@@ -1,8 +1,7 @@
 """
-想法: 用原生 JAX 实现 cumsum 的两种方式对比
+用原生 JAX 实现 cumsum: reshape + 上三角矩阵乘法
 
-方式 1: 直接 jnp.cumsum
-方式 2: reshape 成 chunks + 上三角矩阵乘法 + chunk 间 prefix sum
+支持对序列维度和 batch 维度同时分块，精确控制 tile 大小。
 
 例: [1,2,3,4,5,6,7,8,9]
   reshape → [[1,2,3],[4,5,6],[7,8,9]]
@@ -10,120 +9,151 @@
   再加上前面 chunk 的总和 → 全局 cumsum
 """
 
+import math
+
 import jax
 import jax.numpy as jnp
+from jax import lax
+
+# 全局精度设置
+_PRECISION = lax.Precision.HIGHEST
 
 
-def cumsum_native(x, axis=-1):
-    """方式 1: 直接 jnp.cumsum"""
-    return jnp.cumsum(x, axis=axis)
+def _dot(a, b, contracting_a, contracting_b):
+    """封装 jax.lax.dot_general，统一使用 HIGHEST 精度"""
+    return lax.dot_general(
+        a,
+        b,
+        dimension_numbers=((contracting_a, contracting_b), ((), ())),
+        precision=_PRECISION,
+    )
 
 
-def cumsum_reshape_triu(x, axis=-1, chunk_size=3):
+def cumsum_reshape_triu(x, axis=-1, chunk_size=128, batch_chunk_size=None):
     """
-    方式 2: reshape + 上三角矩阵乘法
-    把 axis 维度切成 chunk，每个 chunk 用 triu matmul 做 local cumsum，
-    再用 jnp.cumsum 算 chunk 间的 prefix sum 加回去。
+    reshape + 上三角矩阵乘法实现 cumsum。
+    全部使用 jax.lax.dot_general + Precision.HIGHEST，确保 TPU 上 float32 精度。
+
+    Args:
+        x: 输入张量
+        axis: cumsum 的轴
+        chunk_size: 序列维度的 chunk 大小 (对应 MXU 的 K/N 维)
+        batch_chunk_size: batch 维度的 chunk 大小 (对应 MXU 的 M 维)
+            None = 不分块; 设为 128 可让每次 matmul 刚好填满 128x128 MXU
+
+    布局 (batch_chunk_size=128, chunk_size=128):
+        输入 (B, L) → (num_batch_chunks, 128, num_seq_chunks, 128)
+        每次 matmul: (128, 128) @ (128, 128) → 刚好填满 MXU
     """
     ndim = x.ndim
     axis = axis % ndim
     L = x.shape[axis]
 
-    # padding
-    pad_len = (chunk_size - L % chunk_size) % chunk_size
-    if pad_len > 0:
+    # 1. Pad 序列维度
+    seq_pad = (chunk_size - L % chunk_size) % chunk_size
+    if seq_pad > 0:
         pad_widths = [(0, 0)] * ndim
-        pad_widths[axis] = (0, pad_len)
+        pad_widths[axis] = (0, seq_pad)
         x = jnp.pad(x, pad_widths)
+    L_padded = L + seq_pad
+    num_seq_chunks = L_padded // chunk_size
 
-    L_padded = L + pad_len
-    num_chunks = L_padded // chunk_size
+    # 2. 标准化为 (B, L_padded) —— 把 axis 移到最后，展平 batch 维
+    x = jnp.moveaxis(x, axis, -1)
+    batch_shape = x.shape[:-1]
+    B = math.prod(batch_shape) if batch_shape else 1
+    x = x.reshape(B, L_padded)
 
-    # 把 axis 维度 reshape 成 (num_chunks, chunk_size)
-    shape = list(x.shape)
-    shape[axis : axis + 1] = [num_chunks, chunk_size]
-    x_chunked = x.reshape(shape)  # (..., num_chunks, chunk_size, ...)
+    # 3. Chunk 序列维度 → (B, num_seq_chunks, chunk_size)
+    x = x.reshape(B, num_seq_chunks, chunk_size)
 
-    # 上三角矩阵
+    # 4. 可选: chunk batch 维度 → (num_batch_chunks, batch_chunk_size, num_seq_chunks, chunk_size)
+    if batch_chunk_size is not None:
+        batch_pad = (batch_chunk_size - B % batch_chunk_size) % batch_chunk_size
+        if batch_pad > 0:
+            x = jnp.pad(x, [(0, batch_pad), (0, 0), (0, 0)])
+        B_padded = B + batch_pad
+        num_batch_chunks = B_padded // batch_chunk_size
+        x = x.reshape(num_batch_chunks, batch_chunk_size, num_seq_chunks, chunk_size)
+        cs_ax = 3  # chunk_size 所在维度
+        nsc_ax = 2  # num_seq_chunks 所在维度
+    else:
+        B_padded = B
+        cs_ax = 2
+        nsc_ax = 1
+
+    # 5. 上三角矩阵 + local cumsum
     triu = jnp.triu(jnp.ones((chunk_size, chunk_size), dtype=x.dtype))
+    # dot_general 收缩 chunk_size，结果的 chunk_size 维在最后
+    local_cs = _dot(x, triu, (cs_ax,), (0,))
 
-    # 每个 chunk 做 local cumsum: x @ triu (沿最后一维)
-    # x_chunked 的 chunk_size 在 axis+1 维
-    local_cs = jnp.tensordot(x_chunked, triu, axes=[[axis + 1], [0]])
-    # tensordot 会把结果维度放到最后，需要 moveaxis 回去
-    dest = axis + 1
-    src = local_cs.ndim - 1
-    if src != dest:
-        local_cs = jnp.moveaxis(local_cs, src, dest)
+    # 6. chunk sums + inter-chunk exclusive prefix sum (也用 triu matmul)
+    chunk_sums = local_cs[..., -1]
+    # strictly upper triangular (k=1) 直接算 exclusive prefix sum，无需 shift
+    triu_chunks = jnp.triu(
+        jnp.ones((num_seq_chunks, num_seq_chunks), dtype=x.dtype), k=1
+    )
+    offsets = _dot(chunk_sums, triu_chunks, (nsc_ax,), (0,))
 
-    # 每个 chunk 的总和 = local_cs 在 chunk_size 维的最后一个元素
-    chunk_sums = jnp.take(local_cs, -1, axis=axis + 1)  # (..., num_chunks, ...)
+    # 7. 加上 offsets
+    result = local_cs + offsets[..., None]
 
-    # chunk 间的 inclusive prefix sum（也用上三角矩阵乘法，避免 jnp.cumsum）
-    triu_chunks = jnp.triu(jnp.ones((num_chunks, num_chunks), dtype=x.dtype))
-    inclusive = jnp.tensordot(chunk_sums, triu_chunks, axes=[[axis], [0]])
-    # tensordot 把结果放到最后一维，moveaxis 回去
-    if inclusive.ndim > 1:
-        inclusive = jnp.moveaxis(inclusive, -1, axis)
-
-    # exclusive prefix sum (shift right, pad 0)
-    pad_widths = [(0, 0)] * inclusive.ndim
-    pad_widths[axis] = (1, 0)
-    slices = [slice(None)] * inclusive.ndim
-    slices[axis] = slice(None, -1)
-    offsets = jnp.pad(inclusive[tuple(slices)], pad_widths)
-
-    # broadcast 加回去
-    offsets = jnp.expand_dims(offsets, axis=axis + 1)
-    result = local_cs + offsets
-
-    # reshape 回去并去掉 padding
-    out_shape = list(x.shape)  # padded shape
-    result = result.reshape(out_shape)
-    slices = [slice(None)] * ndim
-    slices[axis] = slice(None, L)
-    return result[tuple(slices)]
+    # 8. Reshape 回原始形状
+    if batch_chunk_size is not None:
+        result = result.reshape(B_padded, num_seq_chunks, chunk_size)
+    result = result[:B, :, :]
+    result = result.reshape(B, L_padded)[:, :L]
+    result = result.reshape(*batch_shape, L)
+    result = jnp.moveaxis(result, -1, axis)
+    return result
 
 
-# =====================================================================
-# 测试
-# =====================================================================
 if __name__ == "__main__":
+    import timeit
+
     print("=" * 60)
-    print("对比: jnp.cumsum vs reshape+triu matmul")
+    print("cumsum_reshape_triu (jax.lax.dot_general, HIGHEST precision)")
     print("=" * 60)
 
     # 简单示例
     x = jnp.array([1, 2, 3, 4, 5, 6, 7, 8, 9], dtype=jnp.float32)
     print(f"\n输入: {x}")
-    print(f"jnp.cumsum:       {cumsum_native(x)}")
-    print(f"reshape+triu(cs=3): {cumsum_reshape_triu(x, chunk_size=3)}")
+    print(f"jnp.cumsum:               {jnp.cumsum(x)}")
+    print(f"triu(cs=3):               {cumsum_reshape_triu(x, chunk_size=3)}")
+    print(f"triu(cs=3, bcs=3):        {cumsum_reshape_triu(x, chunk_size=3, batch_chunk_size=3)}")
 
     # 正确性测试
     print("\n正确性测试:")
     key = jax.random.PRNGKey(42)
     test_cases = [
-        ((16,), 0, 4, "1-D"),
-        ((4, 32), 1, 8, "2-D axis=1"),
-        ((3, 4, 64), 2, 16, "3-D axis=2"),
-        ((3, 4, 64), 1, 4, "3-D axis=1"),
+        ((16,), 0, 4, None, "1-D"),
+        ((4, 32), 1, 8, None, "2-D axis=1"),
+        ((4, 32), 1, 8, 2, "2-D axis=1 bcs=2"),
+        ((3, 4, 64), 2, 16, None, "3-D axis=2"),
+        ((3, 4, 64), 2, 16, 4, "3-D axis=2 bcs=4"),
+        ((3, 4, 64), 1, 4, None, "3-D axis=1"),
+        ((3, 4, 64), 1, 4, 3, "3-D axis=1 bcs=3"),
+        ((64, 64, 2048), 2, 128, 128, "3-D bcs=128 cs=128"),
     ]
 
-    for shape, axis, cs, desc in test_cases:
+    for *params, desc in test_cases:
+        if len(params) == 3:
+            shape, ax, cs = params
+            bcs = None
+        else:
+            shape, ax, cs, bcs = params
         x = jax.random.normal(key, shape, dtype=jnp.float32)
-        ref = jnp.cumsum(x, axis=axis)
-        out = cumsum_reshape_triu(x, axis=axis, chunk_size=cs)
+        ref = jnp.cumsum(x, axis=ax)
+        out = cumsum_reshape_triu(x, axis=ax, chunk_size=cs, batch_chunk_size=bcs)
         max_err = float(jnp.max(jnp.abs(out - ref)))
         ok = bool(jnp.allclose(out, ref, atol=1e-4))
         status = "PASS" if ok else "FAIL"
-        print(f"  [{status}] {desc:20s} chunk_size={cs:3d}  max_err={max_err:.2e}")
+        print(f"  [{status}] {desc:25s} max_err={max_err:.2e}")
 
     # 性能对比
-    import timeit
-
     print()
     print("=" * 60)
-    print("性能对比")
+    print("性能对比 vs jnp.cumsum")
     print("=" * 60)
 
     perf_shapes = [
@@ -131,13 +161,14 @@ if __name__ == "__main__":
         ((16, 16, 4096), 2, "3-D (16,16,4096)"),
     ]
     chunk_sizes = [128, 256, 512]
+    batch_chunk_sizes = [None, 64, 128, 256]
     warmup = 10
     repeat = 100
 
     for shape, axis, desc in perf_shapes:
         x = jax.random.normal(key, shape, dtype=jnp.float32)
 
-        # baseline
+        # baseline: jnp.cumsum
         fn_ref = jax.jit(jnp.cumsum, static_argnums=(1,))
         for _ in range(warmup):
             fn_ref(x, axis).block_until_ready()
@@ -147,17 +178,23 @@ if __name__ == "__main__":
         t_ref = (timeit.default_timer() - t0) / repeat * 1000
 
         print(f"\n  {desc}  (jnp.cumsum: {t_ref:.3f} ms)")
-        print(f"    {'chunk_size':>10s}  {'reshape+triu':>12s}")
-        print(f"    {'-' * 10}  {'-' * 12}")
+        print(
+            f"    {'cs':>5s}  {'bcs':>5s}  {'time':>10s}"
+        )
+        print(f"    {'-----':>5s}  {'-----':>5s}  {'----------':>10s}")
 
         for cs in chunk_sizes:
-            fn = jax.jit(
-                lambda x, _cs=cs: cumsum_reshape_triu(x, axis=axis, chunk_size=_cs)
-            )
-            for _ in range(warmup):
-                fn(x).block_until_ready()
-            t0 = timeit.default_timer()
-            for _ in range(repeat):
-                fn(x).block_until_ready()
-            t = (timeit.default_timer() - t0) / repeat * 1000
-            print(f"    {cs:>10d}  {t:>10.3f} ms")
+            for bcs in batch_chunk_sizes:
+                fn = jax.jit(
+                    lambda x, _cs=cs, _bcs=bcs: cumsum_reshape_triu(
+                        x, axis=axis, chunk_size=_cs, batch_chunk_size=_bcs
+                    )
+                )
+                for _ in range(warmup):
+                    fn(x).block_until_ready()
+                t0 = timeit.default_timer()
+                for _ in range(repeat):
+                    fn(x).block_until_ready()
+                t = (timeit.default_timer() - t0) / repeat * 1000
+                bcs_str = str(bcs) if bcs else "-"
+                print(f"    {cs:>5d}  {bcs_str:>5s}  {t:>8.3f} ms")
