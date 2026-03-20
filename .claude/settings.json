@@ -1,10 +1,9 @@
 {
   "permissions": {
     "allow": [
-      "Bash(python learning/op/cumsum/cumsum_pallas.py)",
-      "Bash(python learning/op/cumsum/cumsum_pallas_tpu.py)",
-      "Bash(python main.py)",
-      "Bash(python tmp.py)",
+      "Bash(python:*)",
+      "Bash(pip list:*)",
+      "Bash(python3:*)"
       "WebSearch"
     ]
   }
