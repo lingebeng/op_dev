@@ -61,13 +61,17 @@ python /tmp/profile_driver.py
 
 Read the stdout and present a concise summary to the user:
 - **Timing**: mean +/- std in ms
-- **FLOPs / GFLOP/s** (if available from cost_analysis)
+- **FLOPs / GFLOP/s** (if available from cost_analysis; if not reported, just show "None" — do NOT speculate about the reason)
 - **Arithmetic intensity** (FLOPs/byte)
 - **Memory** usage breakdown
 - **Key HLO observations**: dominant ops (dot_general, reduce, etc.), fusion decisions
 - **Trace analysis** is automatic — the profiler parses `.xplane.pb` and prints per-op device timing, hardware specs, and device utilization directly. No need for TensorBoard for basic analysis.
-- If the user wants interactive visualization, suggest: `tensorboard --logdir=/tmp/jax_profile`
+- If the user wants interactive visualization, suggest: `xprof /tmp/jax_profile`
 
 ### 6. Optional: compare multiple configs
 
 If the user specifies multiple shapes or parameter variants, run the profiler for each and present a comparison table.
+
+### 7. Language
+
+Always present the analysis summary to the user in **Chinese (中文)**.

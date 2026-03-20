@@ -22,7 +22,7 @@ import numpy as np
 
 
 # ---------------------------------------------------------------------------
-# Trace Analysis
+# Trace Analysis helpers
 # ---------------------------------------------------------------------------
 
 def _find_latest_xplane(trace_dir: str) -> str | None:
@@ -37,63 +37,75 @@ def _find_latest_trace_json(trace_dir: str) -> str | None:
     return str(candidates[-1]) if candidates else None
 
 
-def analyze_xplane(trace_dir: str, flops: float = 0, bytes_accessed: float = 0) -> bool:
-    """Parse .xplane.pb via jax._src.lib._profile_data and print analysis.
+def _parse_op_type(full_name: str) -> tuple[str, str]:
+    """Extract (short_name, op_type) from a full HLO op name.
 
-    Args:
-        trace_dir: Directory containing xplane trace files.
-        flops: Total FLOPs per invocation (from cost_analysis).
-        bytes_accessed: Total bytes accessed per invocation (from cost_analysis).
+    Returns e.g. ("%cumsum.1", "custom-call") or ("%copy.2", "copy").
+    """
+    parts = full_name.split("=", 1)
+    name = parts[0].strip()
+    op_type = ""
+    if len(parts) > 1:
+        rest = parts[1].strip()
+        for t in rest.split():
+            # Skip type descriptors like f32[...]{...}
+            if t.startswith(("f16", "f32", "f64", "bf16", "s8", "s16", "s32",
+                             "s64", "u8", "u16", "u32", "u64", "pred",
+                             "c64", "c128")):
+                continue
+            op_type = t.split("(")[0]
+            break
+    return name, op_type
 
-    Returns True if analysis succeeded, False otherwise.
+
+# XLA overhead op types (not user kernel logic)
+_OVERHEAD_OPS = frozenset({"copy", "pad", "fusion", "bitcast", "reshape",
+                           "slice", "concatenate", "broadcast", "tuple",
+                           "get-tuple-element", "dynamic-slice"})
+
+
+def _parse_xplane(trace_dir: str) -> dict | None:
+    """Parse .xplane.pb and return structured analysis data.
+
+    Returns dict with hardware specs, kernel timing, op breakdown,
+    and device busy ratio. Returns None if parsing fails.
     """
     xplane_path = _find_latest_xplane(trace_dir)
     if not xplane_path:
-        return False
+        return None
 
     try:
         from jax._src.lib import _profile_data
     except ImportError:
-        return False
+        return None
 
     try:
         pd = _profile_data.ProfileData.from_file(xplane_path)
     except Exception:
-        return False
+        return None
 
     plane = pd.find_plane_with_name("/device:TPU:0")
     if plane is None:
-        # Try other device planes
         for p in pd.planes:
             if p.name.startswith("/device:"):
                 plane = p
                 break
     if plane is None:
-        return False
+        return None
 
     # --- Hardware specs ---
     hw = {}
     for key, val in plane.stats:
         hw[key] = val
 
-    device_type = hw.get("device_type_string", "Unknown")
-    peak_tflops = hw.get("peak_teraflops_per_second", 0)
-    peak_hbm_bw = hw.get("peak_hbm_bw_gigabytes_per_second", 0)
+    result = {
+        "xplane_path": xplane_path,
+        "device_type": hw.get("device_type_string", "Unknown"),
+        "peak_tflops": hw.get("peak_teraflops_per_second", 0),
+        "peak_hbm_bw": hw.get("peak_hbm_bw_gigabytes_per_second", 0),
+    }
 
-    print()
-    print("=" * 60)
-    print("Trace Analysis")
-    print("=" * 60)
-    print(f"  Device: {device_type}")
-    specs = []
-    if peak_tflops:
-        specs.append(f"{peak_tflops:.1f} TFLOPS")
-    if peak_hbm_bw:
-        specs.append(f"HBM BW: {peak_hbm_bw:.1f} GB/s")
-    if specs:
-        print(f"  Peak:   {' | '.join(specs)}")
-
-    # --- XLA Modules (per-invocation kernel time) ---
+    # --- Collect lines ---
     modules_line = None
     ops_line = None
     for line in plane.lines:
@@ -102,149 +114,83 @@ def analyze_xplane(trace_dir: str, flops: float = 0, bytes_accessed: float = 0) 
         elif line.name == "XLA Ops":
             ops_line = line
 
+    # Module-level timing (ground truth for per-invocation device time)
     if modules_line is not None:
         events = list(modules_line.events)
         if events:
             durations_us = [ev.duration_ns / 1000.0 for ev in events]
-            n = len(durations_us)
-            mean_us = sum(durations_us) / n
-            min_us = min(durations_us)
-            max_us = max(durations_us)
-            print()
-            print(f"  Module invocations: {n}")
-            print(f"  Mean kernel time:   {mean_us:.2f} us")
-            if n > 1:
-                print(f"  Min/Max:            {min_us:.2f} / {max_us:.2f} us")
+            result["n_invocations"] = len(durations_us)
+            result["mean_kernel_us"] = sum(durations_us) / len(durations_us)
+            result["min_kernel_us"] = min(durations_us)
+            result["max_kernel_us"] = max(durations_us)
 
-    # --- XLA Ops (per-op timing breakdown) ---
-    if ops_line is not None:
-        events = list(ops_line.events)
-        if events:
-            # Aggregate by op name
-            op_times: dict[str, float] = defaultdict(float)
-            for ev in events:
-                op_times[ev.name] += ev.duration_ns / 1000.0  # ns -> us
+            # Extract module name: "jit_cumsum(hash)" -> "cumsum"
+            raw = events[0].name
+            if "(" in raw:
+                raw = raw[:raw.index("(")]
+            raw = raw.removeprefix("jit_").strip("_")
+            if raw and raw != "lambda":
+                result["module_name"] = raw
 
-            total_us = sum(op_times.values())
-            sorted_ops = sorted(op_times.items(), key=lambda x: x[1], reverse=True)
-
-            # Extract short op names for display
-            def short_name(full: str) -> str:
-                # Format: "%name = f32[...]{...} copy(...)" or "custom-call(...)"
-                parts = full.split("=", 1)
-                name = parts[0].strip()
-                if len(parts) > 1:
-                    rest = parts[1].strip()
-                    # Skip type tokens (e.g. "f32[1024]{1,0:T(8,128)S(1)}")
-                    # and find the actual HLO op keyword
-                    tokens = rest.split()
-                    for t in tokens:
-                        # Skip type descriptors like f32[...]{...}
-                        if t.startswith(("f16", "f32", "f64", "bf16", "s8",
-                                         "s16", "s32", "s64", "u8", "u16",
-                                         "u32", "u64", "pred", "c64", "c128")):
-                            continue
-                        # This should be the op keyword, possibly with args
-                        op_type = t.split("(")[0]
-                        return f"{name} ({op_type})"
-                return name
-
-            print()
-            print("  Top ops by device time:")
-            print(f"    {'Op':<50s} {'Time (us)':>10s}  {'%':>6s}")
-            print(f"    {'-'*50} {'-'*10}  {'-'*6}")
-            for full_name, time_us in sorted_ops[:15]:
-                pct = time_us / total_us * 100 if total_us > 0 else 0
-                sname = short_name(full_name)
-                if len(sname) > 50:
-                    sname = sname[:47] + "..."
-                print(f"    {sname:<50s} {time_us:>10.2f}  {pct:>5.1f}%")
-
-            print(f"    {'-'*50} {'-'*10}  {'-'*6}")
-            print(f"    {'Total':<50s} {total_us:>10.2f}")
-
-    # --- Device utilization ---
-    mean_kernel_us = None
-    if modules_line is not None:
-        events = list(modules_line.events)
-        if events:
-            durations_us = [ev.duration_ns / 1000.0 for ev in events]
-            mean_kernel_us = sum(durations_us) / len(durations_us)
-            # Profile window = first event start to last event end
+            # Device busy ratio
             first_start = min(ev.start_ns for ev in events)
             last_end = max(ev.end_ns for ev in events)
             window_ns = last_end - first_start
             busy_ns = sum(ev.duration_ns for ev in events)
             if window_ns > 0:
-                util_pct = busy_ns / window_ns * 100
-                print()
-                print(f"  Device utilization: {util_pct:.1f}% (over {window_ns / 1000:.1f} us window)")
+                result["device_busy_ratio"] = busy_ns / window_ns
 
-    # --- Roofline analysis ---
-    if mean_kernel_us and mean_kernel_us > 0 and (bytes_accessed > 0 or flops > 0):
-        mean_kernel_s = mean_kernel_us / 1e6
-        print()
-        print("  Roofline:")
-
-        # Ridge point
-        ridge_point = 0.0
-        if peak_tflops and peak_hbm_bw:
-            ridge_point = peak_tflops * 1e3 / peak_hbm_bw  # GFLOP/s / GB/s = FLOPs/byte
-            print(f"    Ridge point:       {ridge_point:.1f} FLOPs/byte")
-
-        # Arithmetic intensity
-        ai = 0.0
-        if flops > 0 and bytes_accessed > 0:
-            ai = flops / bytes_accessed
-            print(f"    Arith intensity:   {ai:.2f} FLOPs/byte")
-
-        # Determine bound
-        if ridge_point > 0 and ai > 0:
-            if ai < ridge_point:
-                print(f"    Bound:             MEMORY  (AI {ai:.1f} < ridge {ridge_point:.1f})")
+    # Op-level breakdown: separate user kernel from XLA overhead
+    kernel_ops = []
+    overhead_ops = []
+    if ops_line is not None:
+        op_times: dict[str, tuple[str, float]] = {}
+        for ev in list(ops_line.events):
+            dur = ev.duration_ns / 1000.0
+            if ev.name in op_times:
+                _, prev = op_times[ev.name]
+                op_times[ev.name] = (op_times[ev.name][0], prev + dur)
             else:
-                print(f"    Bound:             COMPUTE (AI {ai:.1f} >= ridge {ridge_point:.1f})")
+                _, ot = _parse_op_type(ev.name)
+                op_times[ev.name] = (ot, dur)
 
-        # Achieved bandwidth
-        if bytes_accessed > 0 and peak_hbm_bw:
-            achieved_bw = bytes_accessed / mean_kernel_s / 1e9  # GB/s
-            bw_util = achieved_bw / peak_hbm_bw * 100
-            print(f"    Achieved BW:       {achieved_bw:.1f} GB/s ({bw_util:.1f}% of {peak_hbm_bw:.0f} GB/s peak)")
+        for full_name, (op_type, time_us) in op_times.items():
+            short, _ = _parse_op_type(full_name)
+            if op_type in _OVERHEAD_OPS:
+                overhead_ops.append((short, op_type, time_us))
+            else:
+                kernel_ops.append((short, op_type, time_us))
 
-        # Achieved compute
-        if flops > 0 and peak_tflops:
-            achieved_tflops = flops / mean_kernel_s / 1e12
-            compute_util = achieved_tflops / peak_tflops * 100
-            print(f"    Achieved compute:  {achieved_tflops:.3f} TFLOPS ({compute_util:.1f}% of {peak_tflops:.0f} TFLOPS peak)")
+    result["kernel_ops"] = kernel_ops
+    result["overhead_ops"] = overhead_ops
+    result["kernel_us"] = sum(t for _, _, t in kernel_ops)
+    result["overhead_us"] = sum(t for _, _, t in overhead_ops)
 
-    print(f"  Source: {xplane_path}")
-    return True
+    return result
 
 
-def analyze_trace_json(trace_dir: str) -> bool:
+def _parse_trace_json(trace_dir: str) -> dict | None:
     """Fallback: parse .trace.json.gz Chrome Trace Event format.
 
-    Returns True if analysis succeeded, False otherwise.
+    Returns dict with op_times and total_us, or None if parsing fails.
     """
     json_path = _find_latest_trace_json(trace_dir)
     if not json_path:
-        return False
+        return None
 
     try:
         with gzip.open(json_path, "rt") as f:
             data = json.load(f)
     except Exception:
-        return False
+        return None
 
-    # Chrome Trace format: {"traceEvents": [...]}
     events = data if isinstance(data, list) else data.get("traceEvents", [])
     if not events:
-        return False
+        return None
 
-    # Find device events (look for TPU device process)
     device_events = []
     for ev in events:
-        if ev.get("ph") != "X":  # complete events only
+        if ev.get("ph") != "X":
             continue
         cat = ev.get("cat", "")
         name = ev.get("name", "")
@@ -252,31 +198,22 @@ def analyze_trace_json(trace_dir: str) -> bool:
             device_events.append(ev)
 
     if not device_events:
-        return False
+        return None
 
-    # Aggregate by name
     op_times: dict[str, float] = defaultdict(float)
     for ev in device_events:
-        op_times[ev["name"]] += ev.get("dur", 0)  # dur in microseconds
+        op_times[ev["name"]] += ev.get("dur", 0)
 
-    total_us = sum(op_times.values())
-    sorted_ops = sorted(op_times.items(), key=lambda x: x[1], reverse=True)
+    return {
+        "json_path": json_path,
+        "op_times": dict(op_times),
+        "total_us": sum(op_times.values()),
+    }
 
-    print()
-    print("=" * 60)
-    print("Trace Analysis (from trace.json.gz)")
-    print("=" * 60)
-    print(f"  {'Op':<50s} {'Time (us)':>10s}  {'%':>6s}")
-    print(f"  {'-'*50} {'-'*10}  {'-'*6}")
-    for name, time_us in sorted_ops[:15]:
-        pct = time_us / total_us * 100 if total_us > 0 else 0
-        sname = name[:50] if len(name) <= 50 else name[:47] + "..."
-        print(f"  {sname:<50s} {time_us:>10.2f}  {pct:>5.1f}%")
-    print(f"  {'-'*50} {'-'*10}  {'-'*6}")
-    print(f"  {'Total':<50s} {total_us:>10.2f}")
-    print(f"  Source: {json_path}")
-    return True
 
+# ---------------------------------------------------------------------------
+# Main profiler
+# ---------------------------------------------------------------------------
 
 def profile(
     fn,
@@ -289,184 +226,97 @@ def profile(
     **kwargs,
 ):
     """
-    Profile a JAX function end-to-end.
-
-    Produces:
-      1. Cost analysis (FLOPs)
-      2. Memory analysis
-      3. HLO text dump
-      4. jax.profiler.trace capture
-      5. Wall-clock timing (mean/std/median/min/max)
-      6. Arithmetic intensity estimate
+    Profile a JAX function and output a three-layer analysis:
+      Layer 1: Timing   — wall-clock + device kernel breakdown
+      Layer 2: Utilization — roofline analysis (BW, FLOPS vs hardware peak)
+      Layer 3: Optimization Suggestions — actionable observations
 
     Returns:
       dict with timing results and file paths.
     """
     backend = jax.default_backend()
     label = fn_name or getattr(fn, "__name__", str(fn))
-    print(f"Profiling: {label}")
-    print(f"Backend:   {backend}")
-    print()
 
-    # ---- Input/Output shapes ----
-    print("=" * 60)
-    print("Input / Output Shapes")
-    print("=" * 60)
-    for i, a in enumerate(args):
-        if hasattr(a, "shape"):
-            print(f"  arg[{i}]: shape={a.shape}, dtype={a.dtype}")
-        else:
-            print(f"  arg[{i}]: {type(a).__name__} = {a}")
-    for k, v in kwargs.items():
-        if hasattr(v, "shape"):
-            print(f"  {k}: shape={v.shape}, dtype={v.dtype}")
-        else:
-            print(f"  {k}: {type(v).__name__} = {v}")
+    # ==================================================================
+    # Data collection (silent)
+    # ==================================================================
 
-    # JIT compile
+    # ---- Compile ----
     jitted = jax.jit(fn)
     lowered = jitted.lower(*args, **kwargs)
     compiled = lowered.compile()
-
-    # Probe output shape
     out = jitted(*args, **kwargs)
-    if hasattr(out, "shape"):
-        print(f"  output: shape={out.shape}, dtype={out.dtype}")
-    elif isinstance(out, (tuple, list)):
-        for i, o in enumerate(out):
-            if hasattr(o, "shape"):
-                print(f"  output[{i}]: shape={o.shape}, dtype={o.dtype}")
 
     # ---- Cost analysis ----
-    print()
-    print("=" * 60)
-    print("Cost Analysis")
-    print("=" * 60)
     flops = 0
     bytes_accessed = 0
+    cost_details = []
     try:
         costs = compiled.cost_analysis()
         if costs:
-            # costs may be a list of dicts, a list of strings, or a single dict
             if isinstance(costs, dict):
                 costs = [costs]
-            for i, cost in enumerate(costs):
-                tag = f"  [device {i}] " if len(costs) > 1 else "  "
+            for cost in costs:
                 if isinstance(cost, dict):
                     for key, value in cost.items():
-                        print(f"{tag}{key}: {value:,}" if isinstance(value, (int, float)) else f"{tag}{key}: {value}")
+                        cost_details.append((key, value))
                         if key == "flops":
                             flops = value
                         if key == "bytes accessed":
                             bytes_accessed = value
-                elif cost is not None:
-                    print(f"{tag}{cost}")
-            # Fallback: if no total "bytes accessed", sum per-operand keys
+            # Fallback: sum per-operand "bytes accessed*" keys
             if bytes_accessed == 0:
                 for cost in costs:
                     if isinstance(cost, dict):
                         for key, value in cost.items():
                             if key.startswith("bytes accessed") and key != "bytes accessed":
                                 bytes_accessed += value
-        else:
-            print("  (not available)")
-    except Exception as e:
-        print(f"  Error: {e}")
+    except Exception:
+        pass
 
     # ---- Memory analysis ----
-    print()
-    print("=" * 60)
-    print("Memory Analysis")
-    print("=" * 60)
+    mem_info = {}
     try:
         mem = compiled.memory_analysis()
         if mem is not None:
-            attrs = [
-                "argument_size_in_bytes",
-                "output_size_in_bytes",
-                "alias_size_in_bytes",
-                "temp_size_in_bytes",
-                "generated_code_size_in_bytes",
-                "host_temp_size_in_bytes",
-                "host_argument_size_in_bytes",
-                "host_generated_code_size_in_bytes",
-            ]
-            for attr in attrs:
+            for attr in ["argument_size_in_bytes", "output_size_in_bytes",
+                         "temp_size_in_bytes"]:
                 val = getattr(mem, attr, None)
                 if val is not None and val > 0:
-                    print(f"  {attr}: {val:,} bytes ({val / 1024 / 1024:.2f} MB)")
-        else:
-            print("  (not available)")
-    except Exception as e:
-        print(f"  Error: {e}")
+                    mem_info[attr] = val
+    except Exception:
+        pass
 
-    # ---- HLO dump ----
-    print()
-    print("=" * 60)
-    print(f"HLO (saved to {hlo_path})")
-    print("=" * 60)
+    # ---- HLO (save to file) ----
     hlo_lines = 0
     try:
         hlo_text = compiled.as_text()
         Path(hlo_path).write_text(hlo_text)
-        lines = hlo_text.split("\n")
-        hlo_lines = len(lines)
-        for line in lines[:80]:
-            print(f"  {line}")
-        if hlo_lines > 80:
-            print(f"  ... ({hlo_lines - 80} more lines, see {hlo_path})")
-    except Exception as e:
-        print(f"  Error: {e}")
+        hlo_lines = len(hlo_text.split("\n"))
+    except Exception:
+        pass
 
     # ---- Warmup ----
     for _ in range(warmup):
         jitted(*args, **kwargs).block_until_ready()
 
-    # ---- jax.profiler.trace ----
-    print()
-    print("=" * 60)
-    print("JAX Profiler Trace")
-    print("=" * 60)
+    # ---- Trace capture ----
     os.makedirs(trace_dir, exist_ok=True)
+    trace_data = None
     try:
         with jax.profiler.trace(trace_dir):
             for _ in range(5):
                 jitted(*args, **kwargs).block_until_ready()
+        trace_data = _parse_xplane(trace_dir)
+    except Exception:
+        pass
 
-        # Auto-analyze the trace
-        analyzed = analyze_xplane(trace_dir, flops=flops, bytes_accessed=bytes_accessed)
-        if not analyzed:
-            analyzed = analyze_trace_json(trace_dir)
-        if not analyzed:
-            # Fallback: just list files
-            trace_files = []
-            for root, _, files in os.walk(trace_dir):
-                for f in files:
-                    fp = os.path.join(root, f)
-                    size = os.path.getsize(fp)
-                    trace_files.append((fp, size))
-            if trace_files:
-                print("  Generated files:")
-                for fp, size in trace_files:
-                    print(f"    {fp}  ({size:,} bytes)")
-            else:
-                print("  (no trace files generated)")
-
-        print(f"\n  TensorBoard: tensorboard --logdir={trace_dir}")
-    except Exception as e:
-        print(f"  Trace error: {e}")
-
-    # ---- Timing ----
-    print()
-    print("=" * 60)
-    print("Timing Benchmark")
-    print("=" * 60)
+    # ---- Wall-clock timing ----
     times = []
     for _ in range(repeat):
         t0 = timeit.default_timer()
         jitted(*args, **kwargs).block_until_ready()
         times.append(timeit.default_timer() - t0)
-
     times_ms = np.array([t * 1000 for t in times])
     mean_ms = float(np.mean(times_ms))
     std_ms = float(np.std(times_ms))
@@ -474,40 +324,288 @@ def profile(
     min_ms = float(np.min(times_ms))
     max_ms = float(np.max(times_ms))
 
-    print(f"  Iterations: {repeat}")
-    print(f"  Mean:   {mean_ms:.4f} ms")
-    print(f"  Std:    {std_ms:.4f} ms")
-    print(f"  Median: {median_ms:.4f} ms")
-    print(f"  Min:    {min_ms:.4f} ms")
-    print(f"  Max:    {max_ms:.4f} ms")
+    # ==================================================================
+    # OUTPUT: Three-layer analysis
+    # ==================================================================
 
-    # ---- Summary ----
+    # Header
+    print(f"Profiling: {label}")
+    print(f"Backend:   {backend}")
+    for i, a in enumerate(args):
+        if hasattr(a, "shape"):
+            print(f"  in[{i}]:  {a.shape} {a.dtype}")
+    if hasattr(out, "shape"):
+        print(f"  out:    {out.shape} {out.dtype}")
+    elif isinstance(out, (tuple, list)):
+        for i, o in enumerate(out):
+            if hasattr(o, "shape"):
+                print(f"  out[{i}]: {o.shape} {o.dtype}")
+
+    # ================================================================
+    # Layer 1: Timing
+    # ================================================================
     print()
     print("=" * 60)
-    print("Summary")
+    print("Layer 1: Timing")
     print("=" * 60)
-    print(f"  Operator:  {label}")
-    print(f"  Time:      {mean_ms:.4f} ± {std_ms:.4f} ms")
 
-    if flops > 0:
-        total_bytes = sum(
-            a.size * a.dtype.itemsize for a in args if hasattr(a, "size")
-        )
-        if hasattr(out, "size"):
-            total_bytes += out.size * out.dtype.itemsize
+    print(f"  Wall-clock: {mean_ms:.4f} ± {std_ms:.4f} ms"
+          f"  (median {median_ms:.4f}, min {min_ms:.4f}, max {max_ms:.4f},"
+          f" n={repeat})")
 
-        gflops_s = flops / (mean_ms / 1000) / 1e9
-        print(f"  FLOPs:     {flops:,}")
-        print(f"  GFLOP/s:   {gflops_s:.2f}")
-        if total_bytes > 0:
-            ai = flops / total_bytes
-            bw_gb = total_bytes / (mean_ms / 1000) / 1e9
-            print(f"  Data:      {total_bytes:,} bytes ({total_bytes / 1024 / 1024:.2f} MB)")
-            print(f"  Arith intensity: {ai:.2f} FLOPs/byte")
-            print(f"  Bandwidth: {bw_gb:.2f} GB/s")
+    # Resolve display name: fn_name > module_name from trace > label
+    display_name = label
+    device_kernel_us = None
 
-    print(f"  HLO:       {hlo_lines} lines -> {hlo_path}")
-    print(f"  Trace:     {trace_dir}")
+    if trace_data:
+        if not fn_name and trace_data.get("module_name"):
+            display_name = trace_data["module_name"]
+
+        mean_k = trace_data.get("mean_kernel_us")
+        n_inv = trace_data.get("n_invocations", 0)
+        if mean_k is not None:
+            device_kernel_us = mean_k
+            extra = ""
+            if n_inv > 1:
+                extra = (f", min {trace_data['min_kernel_us']:.2f}"
+                         f" / max {trace_data['max_kernel_us']:.2f}")
+            print(f"  Device kernel: {mean_k:.2f} us"
+                  f"  (mean of {n_inv} invocations{extra})")
+
+        # Normalize op times to per-invocation averages
+        divisor = n_inv if n_inv > 1 else 1
+        total_ops_us = (trace_data["kernel_us"] + trace_data["overhead_us"]) / divisor
+        if total_ops_us > 0:
+            # User kernel ops (the ones the user cares about)
+            kernel_ops = sorted(trace_data["kernel_ops"],
+                                key=lambda x: x[2], reverse=True)
+            for short, op_type, t_total in kernel_ops:
+                t = t_total / divisor
+                pct = t / total_ops_us * 100
+                if op_type == "custom-call":
+                    op_label = f"{display_name} (pallas_call)"
+                elif op_type:
+                    op_label = f"{short} ({op_type})"
+                else:
+                    op_label = short
+                if len(op_label) > 50:
+                    op_label = op_label[:47] + "..."
+                print(f"    {op_label:<50s} {t:>8.2f} us  {pct:>5.1f}%")
+
+            # Summarize XLA overhead as one line
+            overhead_us = trace_data["overhead_us"] / divisor
+            if overhead_us > 0:
+                overhead_pct = overhead_us / total_ops_us * 100
+                overhead_detail = ", ".join(
+                    f"{op}={t / divisor:.1f}us" for _, op, t in
+                    sorted(trace_data["overhead_ops"],
+                           key=lambda x: x[2], reverse=True)
+                )
+                print(f"    {'[XLA overhead]':<50s}"
+                      f" {overhead_us:>8.2f} us  {overhead_pct:>5.1f}%"
+                      f"  ({overhead_detail})")
+    else:
+        # Fallback: try trace.json.gz
+        json_data = _parse_trace_json(trace_dir)
+        if json_data:
+            print(f"\n  (from trace.json.gz — xplane unavailable)")
+            sorted_ops = sorted(json_data["op_times"].items(),
+                                key=lambda x: x[1], reverse=True)
+            total_us = json_data["total_us"]
+            for name, t in sorted_ops[:10]:
+                pct = t / total_us * 100 if total_us > 0 else 0
+                sname = name[:50] if len(name) <= 50 else name[:47] + "..."
+                print(f"    {sname:<50s} {t:>8.2f} us  {pct:>5.1f}%")
+
+    # ================================================================
+    # Layer 2: Utilization / BW / Resources
+    # ================================================================
+    print()
+    print("=" * 60)
+    print("Layer 2: Utilization")
+    print("=" * 60)
+
+    def _fmt_bytes(n: int | float) -> str:
+        """Format byte count with adaptive units."""
+        n = float(n)
+        if n < 1024:
+            return f"{n:.0f} B"
+        elif n < 1024 ** 2:
+            return f"{n / 1024:.1f} KB"
+        elif n < 1024 ** 3:
+            return f"{n / 1024 ** 2:.1f} MB"
+        else:
+            return f"{n / 1024 ** 3:.2f} GB"
+
+    # -- Hardware specs --
+    peak_tflops = 0
+    peak_hbm_bw = 0
+    if trace_data:
+        device_type = trace_data["device_type"]
+        peak_tflops = trace_data["peak_tflops"]
+        peak_hbm_bw = trace_data["peak_hbm_bw"]
+
+        print(f"  Device: {device_type}")
+        specs = []
+        if peak_tflops:
+            specs.append(f"{peak_tflops:.1f} TFLOPS")
+        if peak_hbm_bw:
+            specs.append(f"HBM BW: {peak_hbm_bw:.1f} GB/s")
+        if specs:
+            print(f"  Peak:   {' | '.join(specs)}")
+
+        # Device busy ratio
+        busy_ratio = trace_data.get("device_busy_ratio")
+        if busy_ratio is not None:
+            print(f"  Device busy:     {busy_ratio * 100:.1f}%")
+    else:
+        print("  (trace analysis unavailable, using wall-clock — less accurate)")
+
+    # -- I/O tensor sizes --
+    in_bytes = sum(
+        np.prod(a.shape) * a.dtype.itemsize
+        for a in args if hasattr(a, "shape") and hasattr(a, "dtype")
+    )
+    out_bytes = 0
+    if hasattr(out, "shape") and hasattr(out, "dtype"):
+        out_bytes = int(np.prod(out.shape)) * out.dtype.itemsize
+    elif isinstance(out, (tuple, list)):
+        for o in out:
+            if hasattr(o, "shape") and hasattr(o, "dtype"):
+                out_bytes += int(np.prod(o.shape)) * o.dtype.itemsize
+    if in_bytes or out_bytes:
+        print(f"  I/O size:        in {_fmt_bytes(in_bytes)}, out {_fmt_bytes(out_bytes)}"
+              f"  (total {_fmt_bytes(in_bytes + out_bytes)})")
+
+    # -- cost_analysis details --
+    if cost_details:
+        print(f"  Cost analysis:")
+        for key, value in cost_details:
+            if isinstance(value, float) and value == int(value):
+                value = int(value)
+            if isinstance(value, (int, float)) and value >= 1024 and "byte" in key.lower():
+                print(f"    {key}: {value:,} ({_fmt_bytes(value)})")
+            elif isinstance(value, (int, float)):
+                print(f"    {key}: {value:,}")
+            else:
+                print(f"    {key}: {value}")
+
+    # -- Roofline analysis --
+    # Only use device kernel time; if unavailable, show None
+    if device_kernel_us and device_kernel_us > 0 and (bytes_accessed > 0 or flops > 0):
+        kernel_s = device_kernel_us / 1e6
+
+        # Ridge point
+        ridge_point = 0.0
+        if peak_tflops and peak_hbm_bw:
+            ridge_point = peak_tflops * 1e3 / peak_hbm_bw
+
+        # Arithmetic intensity & bound classification
+        if flops > 0 and bytes_accessed > 0:
+            ai = flops / bytes_accessed
+            bound_str = ""
+            if ridge_point > 0:
+                if ai < ridge_point:
+                    bound_str = f"  -> MEMORY-bound (ridge = {ridge_point:.0f})"
+                else:
+                    bound_str = f"  -> COMPUTE-bound (ridge = {ridge_point:.0f})"
+            print(f"  Arith intensity: {ai:.2f} FLOPs/byte{bound_str}")
+        elif bytes_accessed > 0:
+            print(f"  No FLOPs reported  -> likely MEMORY-bound")
+
+        # Achieved bandwidth
+        if bytes_accessed > 0:
+            achieved_bw = bytes_accessed / kernel_s / 1e9
+            if peak_hbm_bw:
+                bw_util = achieved_bw / peak_hbm_bw * 100
+                print(f"  Achieved BW:     {achieved_bw:.1f} GB/s"
+                      f"  ({bw_util:.1f}% of {peak_hbm_bw:.0f} peak)")
+            else:
+                print(f"  Achieved BW:     {achieved_bw:.1f} GB/s")
+
+        # Achieved compute
+        if flops > 0:
+            achieved_tflops = flops / kernel_s / 1e12
+            if peak_tflops:
+                compute_util = achieved_tflops / peak_tflops * 100
+                print(f"  Achieved FLOPS:  {achieved_tflops:.3f} TFLOPS"
+                      f"  ({compute_util:.1f}% of {peak_tflops:.0f} peak)")
+            else:
+                print(f"  Achieved FLOPS:  {achieved_tflops:.3f} TFLOPS")
+    else:
+        if not (bytes_accessed > 0 or flops > 0):
+            print("  Achieved BW:     None (cost_analysis returned no bytes)")
+            print("  Achieved FLOPS:  None (cost_analysis returned no FLOPs)")
+        elif not device_kernel_us:
+            print("  Achieved BW:     None (device kernel time unavailable)")
+            print("  Achieved FLOPS:  None (device kernel time unavailable)")
+
+    # -- Memory usage from compiled.memory_analysis() --
+    if mem_info:
+        parts = []
+        for attr, val in mem_info.items():
+            name = attr.replace("_in_bytes", "").replace("_size", "")
+            parts.append(f"{name}: {_fmt_bytes(val)}")
+        print(f"  Memory alloc:    {', '.join(parts)}")
+
+    # ================================================================
+    # Layer 3: Optimization Suggestions
+    # ================================================================
+    observations = []
+
+    if trace_data:
+        total_ops_us = trace_data["kernel_us"] + trace_data["overhead_us"]
+        overhead_us = trace_data["overhead_us"]
+
+        # 1. XLA overhead check
+        if total_ops_us > 0 and overhead_us > 0:
+            overhead_pct = overhead_us / total_ops_us * 100
+            if overhead_pct > 15:
+                overhead_types = set(op for _, op, _ in trace_data["overhead_ops"])
+                observations.append(
+                    f"XLA overhead is {overhead_pct:.0f}% of device time "
+                    f"({', '.join(sorted(overhead_types))}). "
+                    f"Consider fusing into a larger kernel or fixing input layout.")
+
+        # 2. BW utilization check
+        if (device_kernel_us and bytes_accessed > 0
+                and trace_data["peak_hbm_bw"]):
+            achieved_bw = bytes_accessed / (device_kernel_us / 1e6) / 1e9
+            bw_util = achieved_bw / trace_data["peak_hbm_bw"] * 100
+            if bw_util < 20:
+                observations.append(
+                    f"Low BW utilization ({bw_util:.0f}%). "
+                    f"Kernel may be too small for the DMA pipeline to saturate, "
+                    f"or tile dimensions underutilize MXU lanes.")
+
+        # 3. Host overhead check
+        busy_ratio = trace_data.get("device_busy_ratio")
+        if busy_ratio is not None and busy_ratio < 0.5:
+            observations.append(
+                f"Device is idle {(1 - busy_ratio) * 100:.0f}% of the trace window "
+                f"(host dispatch overhead). "
+                f"Normal for micro-benchmarks of small kernels.")
+
+    if observations:
+        print()
+        print("=" * 60)
+        print("Layer 3: Optimization Suggestions")
+        print("=" * 60)
+        for i, obs in enumerate(observations, 1):
+            print(f"  {i}. {obs}")
+
+    # ================================================================
+    # File references
+    # ================================================================
+    print()
+    print("-" * 60)
+    if hlo_lines:
+        print(f"  HLO:         {hlo_path} ({hlo_lines} lines)")
+    if trace_data:
+        print(f"  Trace:       {trace_data['xplane_path']}")
+    else:
+        print(f"  Trace:       {trace_dir}")
+    print(f"  Xprof:       xprof {trace_dir}")
     print()
 
     return {
@@ -517,6 +615,7 @@ def profile(
         "min_ms": min_ms,
         "max_ms": max_ms,
         "flops": flops,
+        "bytes_accessed": bytes_accessed,
         "trace_dir": trace_dir,
         "hlo_path": hlo_path,
     }
