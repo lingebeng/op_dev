@@ -132,13 +132,6 @@ def _parse_xplane(trace_dir: str) -> dict | None:
             if raw and raw != "lambda":
                 result["module_name"] = raw
 
-            # Device busy ratio
-            first_start = min(ev.start_ns for ev in events)
-            last_end = max(ev.end_ns for ev in events)
-            window_ns = last_end - first_start
-            busy_ns = sum(ev.duration_ns for ev in events)
-            if window_ns > 0:
-                result["device_busy_ratio"] = busy_ns / window_ns
 
     # Op-level breakdown: separate user kernel from XLA overhead
     kernel_ops = []
@@ -454,10 +447,6 @@ def profile(
         if specs:
             print(f"  Peak:   {' | '.join(specs)}")
 
-        # Device busy ratio
-        busy_ratio = trace_data.get("device_busy_ratio")
-        if busy_ratio is not None:
-            print(f"  Device busy:     {busy_ratio * 100:.1f}%")
     else:
         print("  (trace analysis unavailable, using wall-clock — less accurate)")
 
@@ -578,13 +567,6 @@ def profile(
                     f"Kernel may be too small for the DMA pipeline to saturate, "
                     f"or tile dimensions underutilize MXU lanes.")
 
-        # 3. Host overhead check
-        busy_ratio = trace_data.get("device_busy_ratio")
-        if busy_ratio is not None and busy_ratio < 0.5:
-            observations.append(
-                f"Device is idle {(1 - busy_ratio) * 100:.0f}% of the trace window "
-                f"(host dispatch overhead). "
-                f"Normal for micro-benchmarks of small kernels.")
 
     if observations:
         print()
