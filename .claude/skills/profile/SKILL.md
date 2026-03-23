@@ -53,9 +53,13 @@ Key points:
 
 ### 4. Run the driver
 
+Always use `uv run` to execute the driver script, so that the project's virtual environment (with TPU-enabled JAX) is used:
+
 ```bash
-python /tmp/profile_driver.py
+uv run python /tmp/profile_driver.py
 ```
+
+**Important**: Do NOT use bare `python` — it may resolve to the system Python which lacks JAX or has a CPU-only version.
 
 ### 5. Analyze the output
 

@@ -4,7 +4,8 @@
       "Bash(python:*)",
       "Bash(pip list:*)",
       "Bash(python3:*)",
-      "WebSearch"
+      "WebSearch",
+      "Bash(uv run:*)"
     ]
   }
 }
