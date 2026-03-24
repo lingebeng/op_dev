@@ -53,10 +53,11 @@ Key points:
 
 ### 4. Run the driver
 
-Always use `uv run` to execute the driver script, so that the project's virtual environment (with TPU-enabled JAX) is used:
+Always use `uv run` to execute the driver script, so that the project's virtual environment (with TPU-enabled JAX) is used.
+Always set `LIBTPU_INIT_ARGS` to enable LLO custom-call tracing — this adds per-bundle timing and per-op FLOPs/bytes to the xplane with minimal overhead:
 
 ```bash
-uv run python /tmp/profile_driver.py
+LIBTPU_INIT_ARGS="--xla_enable_custom_call_region_trace=true --xla_xprof_register_llo_debug_info=true" uv run python /tmp/profile_driver.py
 ```
 
 **Important**: Do NOT use bare `python` — it may resolve to the system Python which lacks JAX or has a CPU-only version.
@@ -70,6 +71,7 @@ Read the stdout and present a concise summary to the user:
 - **Memory** usage breakdown
 - **Key HLO observations**: dominant ops (dot_general, reduce, etc.), fusion decisions
 - **Trace analysis** is automatic — the profiler parses `.xplane.pb` and prints per-op device timing, hardware specs, and device utilization directly. No need for TensorBoard for basic analysis.
+- **LLO Bundle Breakdown** (Layer 4): When LLO flags are enabled (default), shows per-bundle timing within custom-call kernels. Each bundle is an LLO instruction group; top bundles indicate where compute time is concentrated.
 - If the user wants interactive visualization, suggest: `xprof /tmp/jax_profile`
 
 ### 6. Optional: compare multiple configs

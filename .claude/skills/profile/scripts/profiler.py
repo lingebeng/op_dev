@@ -64,6 +64,126 @@ _OVERHEAD_OPS = frozenset({"copy", "pad", "fusion", "bitcast", "reshape",
                            "get-tuple-element", "dynamic-slice"})
 
 
+def _parse_tensor_core(tc_line, module_events) -> dict | None:
+    """Parse Tensor Core line for LLO bundle-level timing.
+
+    Bundle events are zero-duration markers. Timing is computed from
+    inter-event gaps (next event's device_offset_ps - current event's).
+    """
+    tc_events_raw = list(tc_line.events)
+    if not tc_events_raw or not module_events:
+        return None
+
+    # Build invocation time ranges from XLA Modules events
+    inv_ranges = []
+    for ev in module_events:
+        ev_stats = {}
+        try:
+            for sk, sv in ev.stats:
+                ev_stats[sk] = sv
+        except Exception:
+            pass
+        start_ps = ev_stats.get("device_offset_ps", 0)
+        dur_ps = ev_stats.get("device_duration_ps", 0)
+        if start_ps and dur_ps:
+            inv_ranges.append((float(start_ps), float(start_ps) + float(dur_ps)))
+
+    if not inv_ranges:
+        return None
+
+    # Collect TC events with offset and name
+    tc_events = []
+    for ev in tc_events_raw:
+        ev_stats = {}
+        try:
+            for sk, sv in ev.stats:
+                ev_stats[sk] = sv
+        except Exception:
+            pass
+        offset_ps = float(ev_stats.get("device_offset_ps", 0))
+        long_name = str(ev_stats.get("long_name", ev.name))
+        tc_events.append((offset_ps, ev.name, long_name))
+
+    tc_events.sort(key=lambda x: x[0])
+
+    # Segment TC events into invocations and compute inter-event timing
+    n_inv = len(inv_ranges)
+    bundle_times: dict[str, list[float]] = defaultdict(list)  # name -> [duration_ps]
+    bundle_long_names: dict[str, str] = {}
+
+    inv_idx = 0
+    inv_events = []
+
+    def _flush_inv_events(events, inv_end_ps):
+        for i in range(len(events)):
+            offset, name, long_name = events[i]
+            if i + 1 < len(events):
+                dur_ps = events[i + 1][0] - offset
+            else:
+                dur_ps = inv_end_ps - offset
+            if dur_ps > 0:
+                bundle_times[name].append(dur_ps)
+            bundle_long_names[name] = long_name
+
+    for offset_ps, name, long_name in tc_events:
+        # Find which invocation this event belongs to
+        while inv_idx < n_inv and offset_ps > inv_ranges[inv_idx][1]:
+            if inv_events:
+                _flush_inv_events(inv_events, inv_ranges[inv_idx][1])
+                inv_events = []
+            inv_idx += 1
+        if inv_idx >= n_inv:
+            break
+        if offset_ps >= inv_ranges[inv_idx][0]:
+            inv_events.append((offset_ps, name, long_name))
+
+    # Flush last invocation
+    if inv_events and inv_idx < n_inv:
+        _flush_inv_events(inv_events, inv_ranges[inv_idx][1])
+
+    if not bundle_times:
+        return None
+
+    # Aggregate per-bundle stats
+    bundles = []
+    total_us = 0
+    for name, times_ps in bundle_times.items():
+        total_ps = sum(times_ps)
+        total_us += total_ps / 1e6
+        mean_per_inv_us = total_ps / n_inv / 1e6
+        count_per_inv = len(times_ps) / n_inv
+
+        # Parse hex address from long_name: "[ID]  0xABC: bundle.ID"
+        hex_addr = ""
+        ln = bundle_long_names.get(name, "")
+        if "0x" in ln:
+            part = ln.split("0x", 1)[1]
+            hex_addr = "0x" + part.split(":")[0].split()[0]
+
+        bundles.append({
+            "name": name,
+            "hex_addr": hex_addr,
+            "total_us": total_ps / 1e6,
+            "mean_us_per_inv": mean_per_inv_us,
+            "count_per_inv": count_per_inv,
+        })
+
+    # Sort by total time descending, compute percentages
+    bundles.sort(key=lambda b: b["total_us"], reverse=True)
+    total_us_per_inv = total_us / n_inv if n_inv > 0 else total_us
+    for b in bundles:
+        b["pct"] = b["mean_us_per_inv"] / total_us_per_inv * 100 if total_us_per_inv > 0 else 0
+
+    events_per_inv = len(tc_events_raw) / n_inv if n_inv > 0 else len(tc_events_raw)
+
+    return {
+        "bundles": bundles,
+        "n_bundles": len(bundles),
+        "events_per_inv": int(events_per_inv),
+        "total_bundle_us_per_inv": total_us_per_inv,
+    }
+
+
 def _parse_xplane(trace_dir: str) -> dict | None:
     """Parse .xplane.pb and return structured analysis data.
 
@@ -108,11 +228,14 @@ def _parse_xplane(trace_dir: str) -> dict | None:
     # --- Collect lines ---
     modules_line = None
     ops_line = None
+    tc_line = None
     for line in plane.lines:
         if line.name == "XLA Modules":
             modules_line = line
         elif line.name == "XLA Ops":
             ops_line = line
+        elif line.name == "Tensor Core":
+            tc_line = line
 
     # Module-level timing (ground truth for per-invocation device time)
     if modules_line is not None:
@@ -134,30 +257,55 @@ def _parse_xplane(trace_dir: str) -> dict | None:
 
 
     # Op-level breakdown: separate user kernel from XLA overhead
+    # Tuples: (short_name, op_type, time_us, flops, bytes_accessed)
     kernel_ops = []
     overhead_ops = []
+    xla_ops_flops = 0
+    xla_ops_bytes = 0
     if ops_line is not None:
-        op_times: dict[str, tuple[str, float]] = {}
+        op_times: dict[str, tuple[str, float, float, float]] = {}
         for ev in list(ops_line.events):
             dur = ev.duration_ns / 1000.0
+            # Extract per-event stats (available with LLO flags)
+            ev_flops = 0
+            ev_bytes = 0
+            try:
+                for sk, sv in ev.stats:
+                    if sk == "flops":
+                        ev_flops = float(sv)
+                    elif sk == "bytes_accessed":
+                        ev_bytes = float(sv)
+            except Exception:
+                pass
             if ev.name in op_times:
-                _, prev = op_times[ev.name]
-                op_times[ev.name] = (op_times[ev.name][0], prev + dur)
+                ot, prev_dur, prev_f, prev_b = op_times[ev.name]
+                op_times[ev.name] = (ot, prev_dur + dur,
+                                     prev_f + ev_flops, prev_b + ev_bytes)
             else:
                 _, ot = _parse_op_type(ev.name)
-                op_times[ev.name] = (ot, dur)
+                op_times[ev.name] = (ot, dur, ev_flops, ev_bytes)
 
-        for full_name, (op_type, time_us) in op_times.items():
+        for full_name, (op_type, time_us, op_f, op_b) in op_times.items():
             short, _ = _parse_op_type(full_name)
             if op_type in _OVERHEAD_OPS:
-                overhead_ops.append((short, op_type, time_us))
+                overhead_ops.append((short, op_type, time_us, op_f, op_b))
             else:
-                kernel_ops.append((short, op_type, time_us))
+                kernel_ops.append((short, op_type, time_us, op_f, op_b))
+            xla_ops_flops += op_f
+            xla_ops_bytes += op_b
 
     result["kernel_ops"] = kernel_ops
     result["overhead_ops"] = overhead_ops
-    result["kernel_us"] = sum(t for _, _, t in kernel_ops)
-    result["overhead_us"] = sum(t for _, _, t in overhead_ops)
+    result["kernel_us"] = sum(t for _, _, t, _, _ in kernel_ops)
+    result["overhead_us"] = sum(t for _, _, t, _, _ in overhead_ops)
+    result["xla_ops_flops"] = xla_ops_flops
+    result["xla_ops_bytes"] = xla_ops_bytes
+
+    # --- Tensor Core bundle analysis (with LLO flags) ---
+    if tc_line is not None and modules_line is not None:
+        tc_data = _parse_tensor_core(tc_line, list(modules_line.events))
+        if tc_data:
+            result["tensor_core"] = tc_data
 
     return result
 
@@ -304,6 +452,17 @@ def profile(
     except Exception:
         pass
 
+    # Override cost_analysis flops/bytes with xplane values when available
+    # (xplane per-op stats are more accurate for custom-call ops)
+    if trace_data:
+        n_inv = trace_data.get("n_invocations", 1)
+        xplane_flops = trace_data.get("xla_ops_flops", 0)
+        xplane_bytes = trace_data.get("xla_ops_bytes", 0)
+        if xplane_flops > 0 and flops == 0:
+            flops = int(xplane_flops / n_inv)
+        if xplane_bytes > 0 and bytes_accessed == 0:
+            bytes_accessed = int(xplane_bytes / n_inv)
+
     # ---- Wall-clock timing ----
     times = []
     for _ in range(repeat):
@@ -372,7 +531,7 @@ def profile(
             # User kernel ops (the ones the user cares about)
             kernel_ops = sorted(trace_data["kernel_ops"],
                                 key=lambda x: x[2], reverse=True)
-            for short, op_type, t_total in kernel_ops:
+            for short, op_type, t_total, op_f, op_b in kernel_ops:
                 t = t_total / divisor
                 pct = t / total_ops_us * 100
                 if op_type == "custom-call":
@@ -383,14 +542,21 @@ def profile(
                     op_label = short
                 if len(op_label) > 50:
                     op_label = op_label[:47] + "..."
-                print(f"    {op_label:<50s} {t:>8.2f} us  {pct:>5.1f}%")
+                extra_info = ""
+                if op_f > 0:
+                    gf = op_f / divisor / 1e9
+                    extra_info += f" {gf:.1f}GF"
+                if op_b > 0:
+                    mb = op_b / divisor / 1e6
+                    extra_info += f" {mb:.1f}MB"
+                print(f"    {op_label:<50s} {t:>8.2f} us  {pct:>5.1f}%{extra_info}")
 
             # Summarize XLA overhead as one line
             overhead_us = trace_data["overhead_us"] / divisor
             if overhead_us > 0:
                 overhead_pct = overhead_us / total_ops_us * 100
                 overhead_detail = ", ".join(
-                    f"{op}={t / divisor:.1f}us" for _, op, t in
+                    f"{op}={t / divisor:.1f}us" for _, op, t, _, _ in
                     sorted(trace_data["overhead_ops"],
                            key=lambda x: x[2], reverse=True)
                 )
@@ -550,7 +716,7 @@ def profile(
         if total_ops_us > 0 and overhead_us > 0:
             overhead_pct = overhead_us / total_ops_us * 100
             if overhead_pct > 15:
-                overhead_types = set(op for _, op, _ in trace_data["overhead_ops"])
+                overhead_types = set(op for _, op, _, _, _ in trace_data["overhead_ops"])
                 observations.append(
                     f"XLA overhead is {overhead_pct:.0f}% of device time "
                     f"({', '.join(sorted(overhead_types))}). "
@@ -575,6 +741,28 @@ def profile(
         print("=" * 60)
         for i, obs in enumerate(observations, 1):
             print(f"  {i}. {obs}")
+
+    # ================================================================
+    # Layer 4: LLO Bundle Analysis (when LLO flags are enabled)
+    # ================================================================
+    if trace_data and trace_data.get("tensor_core"):
+        tc = trace_data["tensor_core"]
+        print()
+        print("=" * 60)
+        print("Layer 4: LLO Bundle Analysis")
+        print("=" * 60)
+        print(f"  Bundles: {tc['n_bundles']}  |  "
+              f"Events/invocation: {tc['events_per_inv']}  |  "
+              f"Total: {tc['total_bundle_us_per_inv']:.1f} us/invocation")
+        print()
+        print(f"    {'Bundle':<28s} {'Addr':<8s} "
+              f"{'Time (us)':>10s} {'Count':>6s} {'%':>6s}")
+        print(f"    {'-'*28} {'-'*8} {'-'*10} {'-'*6} {'-'*6}")
+        for b in tc["bundles"]:
+            print(f"    {b['name']:<28s} {b['hex_addr']:<8s} "
+                  f"{b['mean_us_per_inv']:>10.2f} "
+                  f"{b['count_per_inv']:>6.0f} "
+                  f"{b['pct']:>5.1f}%")
 
     # ================================================================
     # File references
