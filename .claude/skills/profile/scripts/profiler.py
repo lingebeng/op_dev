@@ -12,9 +12,19 @@ Usage (standalone, called by Claude skill):
 import gzip
 import json
 import os
+import re
+import shutil
 import timeit
 from collections import defaultdict
 from pathlib import Path
+
+# Ensure Mosaic IR dump for bundle annotation (must precede JAX/libtpu init)
+_MOSAIC_DUMP_DIR = "/tmp/mosaic_dump"
+if "--xla_mosaic_dump_to" not in os.environ.get("LIBTPU_INIT_ARGS", ""):
+    os.environ["LIBTPU_INIT_ARGS"] = (
+        os.environ.get("LIBTPU_INIT_ARGS", "")
+        + " --xla_mosaic_dump_to=" + _MOSAIC_DUMP_DIR
+    ).strip()
 
 import jax
 import jax.numpy as jnp
@@ -353,6 +363,168 @@ def _parse_trace_json(trace_dir: str) -> dict | None:
 
 
 # ---------------------------------------------------------------------------
+# Mosaic IR parsing & bundle annotation
+# ---------------------------------------------------------------------------
+
+def _parse_mosaic_ir(dump_dir: str = _MOSAIC_DUMP_DIR) -> dict | None:
+    """Parse Mosaic post-relayout-insertion IR for kernel structure.
+
+    Returns grid info, op counts, matmul shapes, and a summary string
+    used to annotate LLO bundles. Returns None if dump not available.
+    """
+    dump_path = Path(dump_dir)
+    if not dump_path.exists():
+        return None
+
+    files = sorted(
+        dump_path.glob("*post-relayout-insertion*"),
+        key=lambda p: p.stat().st_mtime,
+    )
+    if not files:
+        return None
+
+    ir_text = files[-1].read_text()
+
+    # Grid dimensions
+    bounds = re.search(
+        r"iteration_bounds\s*=\s*array<i64:\s*([\d,\s]+)>", ir_text
+    )
+    if not bounds:
+        return None
+    grid = tuple(int(x.strip()) for x in bounds.group(1).split(","))
+
+    # Dimension semantics
+    semantics = re.findall(r"dimension_semantics<(\w+)>", ir_text)
+
+    # Count key operations
+    n_matmul = len(re.findall(r"tpu\.matmul\b", ir_text))
+    n_load = len(re.findall(r"tpu\.vector_load\b", ir_text))
+    n_store = len(re.findall(r"tpu\.vector_store\b", ir_text))
+    n_iota = len(re.findall(r"tpu\.iota\b", ir_text))
+    has_cond = bool(re.search(r"scf\.if\b", ir_text))
+    has_extract = bool(re.search(r"vector\.extract\b", ir_text))
+    has_broadcast = bool(re.search(r"vector\.broadcast\b", ir_text))
+
+    # Extract matmul shapes from type signatures
+    matmul_shapes = []
+    for m in re.finditer(
+        r"tpu\.matmul\b.*?:\s*(.*?)$", ir_text, re.MULTILINE
+    ):
+        types = re.findall(r"vector<(\d+x\d+)x\w+>", m.group(1))
+        if len(types) >= 2:
+            lhs = types[0].replace("x", "\u00d7")
+            rhs = types[1].replace("x", "\u00d7")
+            matmul_shapes.append(f"({lhs})@({rhs})")
+
+    # Matmul precision
+    precision = ""
+    prec_match = re.search(
+        r"precision\s*=\s*#tpu\.contract_precision<(\w+)>", ir_text
+    )
+    if prec_match:
+        precision = prec_match.group(1)
+
+    total_iters = 1
+    for g in grid:
+        total_iters *= g
+
+    parallel_size = None
+    for i, sem in enumerate(semantics):
+        if sem == "parallel" and i < len(grid):
+            parallel_size = grid[i]
+
+    # Build summary string
+    parts: list[str] = []
+    if matmul_shapes:
+        ms = matmul_shapes[0]
+        if precision:
+            ms += f" [{precision}]"
+        parts.append(f"matmul {ms}")
+    if has_cond:
+        parts.append("cond_init")
+    if n_load:
+        parts.append(f"{n_load}\u00d7load")
+    if n_store:
+        parts.append(f"{n_store}\u00d7store")
+    if n_iota:
+        parts.append("mask_gen")
+    if has_extract:
+        parts.append("carry")
+    if has_broadcast:
+        parts.append("broadcast")
+
+    return {
+        "grid": grid,
+        "semantics": semantics,
+        "total_iterations": total_iters,
+        "parallel_size": parallel_size,
+        "has_matmul": n_matmul > 0,
+        "has_cond": has_cond,
+        "matmul_shapes": matmul_shapes,
+        "summary": ", ".join(parts) if parts else "unknown",
+        "ir_path": str(files[-1]),
+    }
+
+
+def _annotate_bundles(bundles: list[dict], mosaic: dict) -> None:
+    """Add 'inferred_op' to bundles using count-based heuristics.
+
+    Modifies bundles in-place.  Heuristics:
+      1. count ≈ parallel_size  → cond init (@pl.when)
+      2. highest-time per-iter  → matmul (if IR has matmul)
+      3. count slightly < total → DMA/vec (pipeline steady)
+      4. remaining per-iter     → vector/DMA
+      5. tiny percentage        → pipeline ctrl
+    """
+    total = mosaic["total_iterations"]
+    par = mosaic.get("parallel_size")
+
+    # Process bundles from highest to lowest time
+    by_time = sorted(
+        range(len(bundles)),
+        key=lambda i: bundles[i]["mean_us_per_inv"],
+        reverse=True,
+    )
+
+    matmul_assigned = False
+
+    for idx in by_time:
+        b = bundles[idx]
+        count = b["count_per_inv"]
+        tol = max(3, total * 0.05)
+
+        # 1. Conditional init: count ≈ parallel_size (but != total)
+        if (
+            par
+            and par != total
+            and abs(count - par) <= max(2, par * 0.1)
+        ):
+            b["inferred_op"] = "cond init (@pl.when)"
+            continue
+
+        is_per_iter = abs(count - total) <= tol
+        is_steady = (total - count > tol) and (count > total * 0.85)
+
+        if is_per_iter:
+            if not matmul_assigned and mosaic["has_matmul"]:
+                shape = (
+                    mosaic["matmul_shapes"][0]
+                    if mosaic.get("matmul_shapes")
+                    else ""
+                )
+                b["inferred_op"] = f"matmul {shape}".strip()
+                matmul_assigned = True
+            else:
+                b["inferred_op"] = "vector/DMA"
+        elif is_steady:
+            b["inferred_op"] = "DMA/vec (pipeline steady)"
+        elif b["pct"] < 0.5:
+            b["inferred_op"] = "pipeline ctrl"
+        else:
+            b["inferred_op"] = "?"
+
+
+# ---------------------------------------------------------------------------
 # Main profiler
 # ---------------------------------------------------------------------------
 
@@ -385,7 +557,12 @@ def profile(
     # ---- Compile ----
     jitted = jax.jit(fn)
     lowered = jitted.lower(*args, **kwargs)
+    # Clean mosaic dump dir for fresh IR capture
+    _mosaic_path = Path(_MOSAIC_DUMP_DIR)
+    if _mosaic_path.exists():
+        shutil.rmtree(_mosaic_path)
     compiled = lowered.compile()
+    mosaic_info = _parse_mosaic_ir()
     out = jitted(*args, **kwargs)
 
     # ---- Cost analysis ----
@@ -751,18 +928,41 @@ def profile(
         print("=" * 60)
         print("Layer 4: LLO Bundle Analysis")
         print("=" * 60)
+
+        # Annotate bundles with Mosaic IR info if available
+        if mosaic_info:
+            _annotate_bundles(tc["bundles"], mosaic_info)
+            print(f"  Kernel: {mosaic_info['summary']}")
+            grid_str = ", ".join(str(g) for g in mosaic_info["grid"])
+            sem_str = ", ".join(mosaic_info["semantics"])
+            print(f"  Grid: ({grid_str}) = {mosaic_info['total_iterations']}"
+                  f" iters  [{sem_str}]")
+
         print(f"  Bundles: {tc['n_bundles']}  |  "
               f"Events/invocation: {tc['events_per_inv']}  |  "
               f"Total: {tc['total_bundle_us_per_inv']:.1f} us/invocation")
         print()
-        print(f"    {'Bundle':<28s} {'Addr':<8s} "
-              f"{'Time (us)':>10s} {'Count':>6s} {'%':>6s}")
-        print(f"    {'-'*28} {'-'*8} {'-'*10} {'-'*6} {'-'*6}")
-        for b in tc["bundles"]:
-            print(f"    {b['name']:<28s} {b['hex_addr']:<8s} "
-                  f"{b['mean_us_per_inv']:>10.2f} "
-                  f"{b['count_per_inv']:>6.0f} "
-                  f"{b['pct']:>5.1f}%")
+
+        has_inferred = any("inferred_op" in b for b in tc["bundles"])
+        if has_inferred:
+            print(f"    {'Bundle':<28s} {'Inferred Op':<28s} "
+                  f"{'Time (us)':>10s} {'Count':>6s} {'%':>6s}")
+            print(f"    {'-'*28} {'-'*28} {'-'*10} {'-'*6} {'-'*6}")
+            for b in tc["bundles"]:
+                inferred = b.get("inferred_op", "")
+                print(f"    {b['name']:<28s} {inferred:<28s} "
+                      f"{b['mean_us_per_inv']:>10.2f} "
+                      f"{b['count_per_inv']:>6.0f} "
+                      f"{b['pct']:>5.1f}%")
+        else:
+            print(f"    {'Bundle':<28s} {'Addr':<8s} "
+                  f"{'Time (us)':>10s} {'Count':>6s} {'%':>6s}")
+            print(f"    {'-'*28} {'-'*8} {'-'*10} {'-'*6} {'-'*6}")
+            for b in tc["bundles"]:
+                print(f"    {b['name']:<28s} {b['hex_addr']:<8s} "
+                      f"{b['mean_us_per_inv']:>10.2f} "
+                      f"{b['count_per_inv']:>6.0f} "
+                      f"{b['pct']:>5.1f}%")
 
     # ================================================================
     # File references
@@ -771,6 +971,8 @@ def profile(
     print("-" * 60)
     if hlo_lines:
         print(f"  HLO:         {hlo_path} ({hlo_lines} lines)")
+    if mosaic_info:
+        print(f"  Mosaic IR:   {mosaic_info['ir_path']}")
     if trace_data:
         print(f"  Trace:       {trace_data['xplane_path']}")
     else:
