@@ -210,57 +210,51 @@ def _chunk_cumsum_kernel_varlen(
 def _chunk_cumsum_kernel_varlen_v2(
     cu_seqlens_ref,
     chunk_indices_ref,
-    s_ref,
-    o_ref,
+    s_ref,       # (BB, T_alloc, BS) — tiled by BlockSpec
+    o_ref,       # (BB, T_alloc, BS)
     *,
     BT: int,
-    BS: int,
-    BB: int,
+    NT: int,
     REVERSE: bool,
     HAS_SCALE: bool,
     scale: float,
 ):
-    i_s, i_t, i_bb = pl.program_id(0), pl.program_id(1), pl.program_id(2)
-
-    i_n, local_i_t = chunk_indices_ref[i_t, 0], chunk_indices_ref[i_t, 1]
-    bos, eos = cu_seqlens_ref[i_n], cu_seqlens_ref[i_n + 1]
-    start_t = bos + local_i_t * BT
-    start_s = i_s * BS
-    start_bh = i_bb * BB
-
-    # Load (BB, BT, BS) tile
-    s = s_ref[dslice(start_bh, BB), dslice(start_t, BT), dslice(start_s, BS)]
-
-    # Varlen masking: zero out positions beyond the sequence boundary
-    T_seq = eos - bos
-    valid_len = T_seq - local_i_t * BT
-    valid_mask = (jnp.arange(BT) < valid_len).astype(jnp.float32)[None, :, None]
-    s = s.astype(jnp.float32) * valid_mask
-
-    # Vectorized Hillis-Steele: operate on the full tensor at once.
-    # Instead of extracting 64 individual rows (causing sublane relayout),
-    # use slice + concat to shift entire sublane ranges.
     num_steps = int(math.log2(BT))
 
-    if REVERSE:
-        for d in range(num_steps):
-            stride = 1 << d
-            # s[:, i, :] += s[:, i+stride, :] for i < BT-stride
-            top = s[:, :BT - stride, :] + s[:, stride:, :]
-            bot = s[:, BT - stride:, :]
-            s = jnp.concatenate([top, bot], axis=1)
-    else:
-        for d in range(num_steps):
-            stride = 1 << d
-            # s[:, i, :] += s[:, i-stride, :] for i >= stride
-            top = s[:, :stride, :]
-            bot = s[:, stride:, :] + s[:, :-stride, :]
-            s = jnp.concatenate([top, bot], axis=1)
+    # Use fori_loop instead of Python for-range to avoid trace-time unrolling.
+    # Each output block is written by exactly one program (avoids double-buffer eviction).
+    def body(i_t, _):
+        i_n, local_i_t = chunk_indices_ref[i_t, 0], chunk_indices_ref[i_t, 1]
+        bos, eos = cu_seqlens_ref[i_n], cu_seqlens_ref[i_n + 1]
+        start_t = bos + local_i_t * BT
 
-    if HAS_SCALE:
-        s = s * scale
+        s = s_ref[:, dslice(start_t, BT), :]
 
-    o_ref[dslice(start_bh, BB), dslice(start_t, BT), dslice(start_s, BS)] = s.astype(o_ref.dtype)
+        T_seq = eos - bos
+        valid_len = T_seq - local_i_t * BT
+        valid_mask = (jnp.arange(BT) < valid_len).astype(jnp.float32)[None, :, None]
+        s = s.astype(jnp.float32) * valid_mask
+
+        if REVERSE:
+            for d in range(num_steps):
+                stride = 1 << d
+                top = s[:, :BT - stride, :] + s[:, stride:, :]
+                bot = s[:, BT - stride:, :]
+                s = jnp.concatenate([top, bot], axis=1)
+        else:
+            for d in range(num_steps):
+                stride = 1 << d
+                top = s[:, :stride, :]
+                bot = s[:, stride:, :] + s[:, :-stride, :]
+                s = jnp.concatenate([top, bot], axis=1)
+
+        if HAS_SCALE:
+            s = s * scale
+
+        o_ref[:, dslice(start_t, BT), :] = s.astype(o_ref.dtype)
+        return 0
+
+    jax.lax.fori_loop(0, NT, body, 0)
 
 
 def _chunk_local_cumsum_pallas_v2(
@@ -311,16 +305,21 @@ def _chunk_local_cumsum_pallas_v2(
     # Pad T for varlen dslice overflow
     g_flat = jnp.pad(g_flat, ((0, 0), (0, BT), (0, 0)))
 
-    grid = (NS, NT, NBH)
+    grid = (NS, NBH)
+    T_alloc = g_flat.shape[1]  # T + BT (after padding)
 
     kernel = functools.partial(
         _chunk_cumsum_kernel_varlen_v2,
         BT=BT,
-        BS=BS,
-        BB=BB,
+        NT=NT,
         REVERSE=reverse,
         HAS_SCALE=HAS_SCALE,
         scale=scale_val,
+    )
+
+    block_spec = pl.BlockSpec(
+        index_map=lambda i_s, i_bb, *_: (i_bb, 0, i_s),
+        block_shape=(BB, T_alloc, BS),
     )
 
     o_flat = pl.pallas_call(
@@ -328,8 +327,8 @@ def _chunk_local_cumsum_pallas_v2(
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=2,
             grid=grid,
-            in_specs=pl.no_block_spec,
-            out_specs=pl.no_block_spec,
+            in_specs=[block_spec],
+            out_specs=block_spec,
         ),
         out_shape=jax.ShapeDtypeStruct(g_flat.shape, out_dtype),
         interpret=interpret,
