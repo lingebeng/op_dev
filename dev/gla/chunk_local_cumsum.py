@@ -204,6 +204,146 @@ def _chunk_cumsum_kernel_varlen(
     o_ref[dslice(start_bh, BB), dslice(start_t, BT), dslice(start_s, BS)] = o.astype(o_ref.dtype)
 
 
+# ============================================================
+# Variable-length mode v2: vectorized Hillis-Steele (no row extraction)
+# ============================================================
+def _chunk_cumsum_kernel_varlen_v2(
+    cu_seqlens_ref,
+    chunk_indices_ref,
+    s_ref,
+    o_ref,
+    *,
+    BT: int,
+    BS: int,
+    BB: int,
+    REVERSE: bool,
+    HAS_SCALE: bool,
+    scale: float,
+):
+    i_s, i_t, i_bb = pl.program_id(0), pl.program_id(1), pl.program_id(2)
+
+    i_n, local_i_t = chunk_indices_ref[i_t, 0], chunk_indices_ref[i_t, 1]
+    bos, eos = cu_seqlens_ref[i_n], cu_seqlens_ref[i_n + 1]
+    start_t = bos + local_i_t * BT
+    start_s = i_s * BS
+    start_bh = i_bb * BB
+
+    # Load (BB, BT, BS) tile
+    s = s_ref[dslice(start_bh, BB), dslice(start_t, BT), dslice(start_s, BS)]
+
+    # Varlen masking: zero out positions beyond the sequence boundary
+    T_seq = eos - bos
+    valid_len = T_seq - local_i_t * BT
+    valid_mask = (jnp.arange(BT) < valid_len).astype(jnp.float32)[None, :, None]
+    s = s.astype(jnp.float32) * valid_mask
+
+    # Vectorized Hillis-Steele: operate on the full tensor at once.
+    # Instead of extracting 64 individual rows (causing sublane relayout),
+    # use slice + concat to shift entire sublane ranges.
+    num_steps = int(math.log2(BT))
+
+    if REVERSE:
+        for d in range(num_steps):
+            stride = 1 << d
+            # s[:, i, :] += s[:, i+stride, :] for i < BT-stride
+            top = s[:, :BT - stride, :] + s[:, stride:, :]
+            bot = s[:, BT - stride:, :]
+            s = jnp.concatenate([top, bot], axis=1)
+    else:
+        for d in range(num_steps):
+            stride = 1 << d
+            # s[:, i, :] += s[:, i-stride, :] for i >= stride
+            top = s[:, :stride, :]
+            bot = s[:, stride:, :] + s[:, :-stride, :]
+            s = jnp.concatenate([top, bot], axis=1)
+
+    if HAS_SCALE:
+        s = s * scale
+
+    o_ref[dslice(start_bh, BB), dslice(start_t, BT), dslice(start_s, BS)] = s.astype(o_ref.dtype)
+
+
+def _chunk_local_cumsum_pallas_v2(
+    g: jax.Array,
+    chunk_size: int,
+    reverse: bool = False,
+    scale: float | None = None,
+    cu_seqlens: jax.Array | None = None,
+    head_first: bool = False,
+    output_dtype: jnp.dtype | None = jnp.float32,
+    chunk_indices: jax.Array | None = None,
+) -> jax.Array:
+    BT = chunk_size
+    BS = 128
+    BB = 8
+
+    if head_first:
+        B, H, T, S = g.shape
+        g_flat = g.reshape(B * H, T, S)
+    else:
+        B, T, H, S = g.shape
+        g_flat = jnp.transpose(g, (0, 2, 1, 3)).reshape(B * H, T, S)
+
+    BH = B * H
+    out_dtype = output_dtype or g.dtype
+    HAS_SCALE = scale is not None
+    scale_val = scale if scale is not None else 1.0
+
+    interpret = jax.default_backend() != "tpu"
+
+    # Pad S dimension to multiple of BS
+    pad_S = (BS - (S % BS)) % BS
+    if pad_S > 0:
+        g_flat = jnp.pad(g_flat, ((0, 0), (0, 0), (0, pad_S)))
+    S_padded = S + pad_S
+    NS = S_padded // BS
+
+    # Pad BH dimension to multiple of BB
+    pad_BH = (BB - (BH % BB)) % BB
+    if pad_BH > 0:
+        g_flat = jnp.pad(g_flat, ((0, pad_BH), (0, 0), (0, 0)))
+    NBH = (BH + pad_BH) // BB
+
+    if chunk_indices is None:
+        chunk_indices = prepare_chunk_indices(cu_seqlens, BT)
+    NT = len(chunk_indices)
+
+    # Pad T for varlen dslice overflow
+    g_flat = jnp.pad(g_flat, ((0, 0), (0, BT), (0, 0)))
+
+    grid = (NS, NT, NBH)
+
+    kernel = functools.partial(
+        _chunk_cumsum_kernel_varlen_v2,
+        BT=BT,
+        BS=BS,
+        BB=BB,
+        REVERSE=reverse,
+        HAS_SCALE=HAS_SCALE,
+        scale=scale_val,
+    )
+
+    o_flat = pl.pallas_call(
+        kernel,
+        grid_spec=pltpu.PrefetchScalarGridSpec(
+            num_scalar_prefetch=2,
+            grid=grid,
+            in_specs=pl.no_block_spec,
+            out_specs=pl.no_block_spec,
+        ),
+        out_shape=jax.ShapeDtypeStruct(g_flat.shape, out_dtype),
+        interpret=interpret,
+    )(cu_seqlens, chunk_indices, g_flat)
+
+    # Remove all padding
+    o_flat = o_flat[:BH, :T, :S]
+
+    if head_first:
+        return o_flat.reshape(B, H, T, S)
+    else:
+        return jnp.transpose(o_flat.reshape(B, H, T, S), (0, 2, 1, 3))
+
+
 def _chunk_local_cumsum_pallas(
     g: jax.Array,
     chunk_size: int,
@@ -316,8 +456,8 @@ def chunk_local_cumsum_vector(
                 g, chunk_size, reverse, scale, head_first, output_dtype
             )
     else:
-        # Variable-length mode: Pallas kernel with Hillis-Steele
-        return _chunk_local_cumsum_pallas(
+        # Variable-length mode: vectorized Hillis-Steele Pallas kernel
+        return _chunk_local_cumsum_pallas_v2(
             g, chunk_size, reverse, scale, cu_seqlens, head_first, output_dtype, chunk_indices
         )
 
